@@ -6,6 +6,8 @@ import time
 import hashlib
 import re
 import math
+import json
+import uuid
 from collections import Counter
 from io import StringIO
 from dotenv import load_dotenv
@@ -23,7 +25,7 @@ load_dotenv()
 # authentication
 
 api_key = os.getenv("WOODWIDE_API_KEY")
-base_url = "https://api.woodwide.ai"
+base_url = os.getenv("WOODWIDE_BASE_URL", "https://api.woodwide.ai").rstrip("/")
 headers = {"Authorization": f"Bearer {api_key}"}
 MODEL_POLL_INTERVAL_SECONDS = 5
 MODEL_TRAIN_TIMEOUT_SECONDS = 30 * 60
@@ -269,9 +271,14 @@ def get_or_create_dataset_from_bytes(file_bytes, filename, dataset_name):
     return response.json()["dataset"]["id"]
 
 
-def wait_for_model_ready(model_id):
+def current_model_wait_timeout_seconds():
+    return st.session_state.get("model_wait_timeout_seconds", MODEL_TRAIN_TIMEOUT_SECONDS)
+
+
+def wait_for_model_ready(model_id, timeout_seconds=None):
     started_at = time.monotonic()
     status_placeholder = st.empty()
+    timeout_seconds = timeout_seconds or current_model_wait_timeout_seconds()
 
     while True:
         status_response = requests.get(
@@ -298,12 +305,101 @@ def wait_for_model_ready(model_id):
             st.write(model_response)
             return False
 
-        if elapsed_seconds >= MODEL_TRAIN_TIMEOUT_SECONDS:
-            st.write("Timed out waiting for model training.")
+        if elapsed_seconds >= timeout_seconds:
+            st.write("Stopped waiting locally while model training is still pending.")
             st.write(model_response)
-            return False
+            return None
 
         time.sleep(MODEL_POLL_INTERVAL_SECONDS)
+
+
+def wait_for_training_complete(model_id, job_id):
+    if job_id:
+        job_status = wait_for_job_succeeded(job_id, "model training")
+        if job_status is not True:
+            return job_status
+
+    return wait_for_model_ready(model_id)
+
+
+def train_model(model_name, model_type, dataset_id, label_column=None, input_columns=None):
+    payload = {
+        "model_name": model_name,
+        "model_type": model_type,
+        "dataset_id": dataset_id,
+    }
+    if label_column:
+        payload["label_column"] = label_column
+    if input_columns:
+        payload["input_columns"] = input_columns
+
+    response = requests.post(
+        f"{base_url}/models/train",
+        headers=headers,
+        json=payload,
+    )
+
+    if response.status_code == 409:
+        unique_model_name = f"{model_name}_{uuid.uuid4().hex[:8]}"
+        st.warning(f"Model name already exists. Training as {unique_model_name}.")
+        payload["model_name"] = unique_model_name
+        response = requests.post(
+            f"{base_url}/models/train",
+            headers=headers,
+            json=payload,
+        )
+
+    if response.status_code not in SUCCESS_STATUS_CODES:
+        st.write(response.status_code)
+        st.write(response.text)
+        response.raise_for_status()
+
+    payload = response.json()
+    return payload["model"]["id"], payload.get("job_id")
+
+
+def get_or_start_model_training(
+    ready_models,
+    ready_key,
+    pending_key,
+    training_label,
+    ready_message,
+    start_training,
+):
+    if ready_key in ready_models:
+        model_id = ready_models[ready_key]
+        st.success(f"Reusing trained {training_label} model.")
+        return model_id
+
+    pending_training = st.session_state.pending_model_jobs.get(pending_key)
+    if pending_training:
+        model_id = pending_training["model_id"]
+        training_job_id = pending_training.get("job_id")
+        st.info(f"Resuming wait for existing {training_label} training job.")
+    else:
+        model_id, training_job_id = start_training()
+        st.session_state.pending_model_jobs[pending_key] = {
+            "model_id": model_id,
+            "job_id": training_job_id,
+        }
+
+    training_status = wait_for_training_complete(model_id, training_job_id)
+    if training_status is True:
+        st.success(ready_message)
+        ready_models[ready_key] = model_id
+        st.session_state.pending_model_jobs.pop(pending_key, None)
+        return model_id
+
+    if training_status is False:
+        st.session_state.pending_model_jobs.pop(pending_key, None)
+        st.error(f"{training_label.title()} model training failed.")
+        st.stop()
+
+    st.warning(
+        f"{training_label.title()} model training is still queued or running. "
+        "This is not a failure; refresh or rerun the app later to resume polling the same job."
+    )
+    st.stop()
 
 
 def read_inference_csv(response):
@@ -323,6 +419,470 @@ def read_inference_csv(response):
         raise ValueError("Inference response JSON did not include CSV or row data.")
 
     return pd.read_csv(StringIO(response.text))
+
+
+def dataframe_from_column_oriented_data(data):
+    if isinstance(data, dict):
+        return pd.DataFrame(data)
+    if isinstance(data, list):
+        return pd.DataFrame(data)
+    if isinstance(data, str):
+        return pd.read_csv(StringIO(data))
+    return pd.DataFrame()
+
+
+def read_inference_json(response):
+    payload = response.json()
+    return dataframe_from_column_oriented_data(payload.get("data", payload)), payload
+
+
+def read_uploaded_csv(uploaded_file):
+    uploaded_file.seek(0)
+    dataframe = pd.read_csv(uploaded_file)
+    uploaded_file.seek(0)
+    return dataframe
+
+
+def add_missing_columns(left, right):
+    missing_columns = [column for column in right.columns if column not in left.columns]
+    if not missing_columns:
+        return left
+
+    return pd.concat(
+        [
+            left.reset_index(drop=True),
+            right[missing_columns].reset_index(drop=True),
+        ],
+        axis=1,
+    )
+
+
+def count_preferred_columns(dataframe):
+    return sum(
+        column in dataframe.columns and dataframe[column].notna().any()
+        for column in PREFERRED_ANALYSIS_COLUMNS
+    )
+
+
+def add_original_customer_features(scored_customers, source_customers):
+    scored_customers = scored_customers.copy()
+    source_customers = source_customers.copy().reset_index(drop=True)
+
+    if "CustomerID" in scored_customers.columns and "CustomerID" in source_customers.columns:
+        merged = scored_customers.merge(
+            source_customers,
+            on="CustomerID",
+            how="left",
+            suffixes=("", "_source"),
+        )
+        if count_preferred_columns(merged) > count_preferred_columns(scored_customers):
+            return merged
+
+    if "id" in scored_customers.columns:
+        source_by_row_id = source_customers.copy()
+        source_by_row_id["_source_row_id"] = source_by_row_id.index.map(normalized_merge_id)
+        scored_by_row_id = scored_customers.copy()
+        scored_by_row_id["_source_row_id"] = scored_by_row_id["id"].map(normalized_merge_id)
+        merged = scored_by_row_id.merge(
+            source_by_row_id,
+            on="_source_row_id",
+            how="left",
+            suffixes=("", "_source"),
+        ).drop(columns=["_source_row_id"])
+        if count_preferred_columns(merged) > count_preferred_columns(scored_customers):
+            return merged
+
+    if len(scored_customers) == len(source_customers):
+        return add_missing_columns(scored_customers, source_customers)
+
+    return scored_customers
+
+
+def add_prediction_descriptions(scored_customers, inference_payload):
+    prediction_descriptions = inference_payload.get("prediction_descriptions")
+    if not prediction_descriptions and inference_payload.get("descriptions"):
+        try:
+            descriptions = inference_payload["descriptions"]
+            if isinstance(descriptions, str):
+                descriptions = json.loads(descriptions)
+            prediction_descriptions = descriptions.get("prediction_descriptions")
+        except (AttributeError, json.JSONDecodeError):
+            prediction_descriptions = None
+
+    if isinstance(prediction_descriptions, str):
+        try:
+            prediction_descriptions = json.loads(prediction_descriptions)
+        except json.JSONDecodeError:
+            prediction_descriptions = None
+
+    if isinstance(prediction_descriptions, list):
+        prediction_descriptions = {
+            item.get("label", item.get("prediction")): item.get("description", item.get("explanation", ""))
+            for item in prediction_descriptions
+            if isinstance(item, dict)
+        }
+
+    if not isinstance(prediction_descriptions, dict):
+        prediction_descriptions = None
+
+    if not prediction_descriptions or "prediction" not in scored_customers.columns:
+        return scored_customers
+
+    descriptions_by_label = {
+        str(label): description
+        for label, description in prediction_descriptions.items()
+    }
+    scored_customers = scored_customers.copy()
+    scored_customers["prediction_class_explanation"] = scored_customers["prediction"].map(
+        lambda prediction: descriptions_by_label.get(str(prediction), "")
+    )
+    return scored_customers
+
+
+def wait_for_job_succeeded(job_id, label, timeout_seconds=None):
+    started_at = time.monotonic()
+    status_placeholder = st.empty()
+    timeout_seconds = timeout_seconds or current_model_wait_timeout_seconds()
+
+    while True:
+        job_response = requests.get(
+            f"{base_url}/jobs/{job_id}",
+            headers=headers,
+        )
+
+        if job_response.status_code != 200:
+            st.write(job_response.status_code)
+            st.write(job_response.text)
+            job_response.raise_for_status()
+
+        job_payload = job_response.json()
+        status = job_payload.get("status")
+        elapsed_seconds = int(time.monotonic() - started_at)
+        status_placeholder.write(
+            f"{label} status: {status or 'unknown'} ({elapsed_seconds // 60}m {elapsed_seconds % 60}s)"
+        )
+
+        if status in ("succeeded", "ready", "completed", "success"):
+            return True
+
+        if status in ("failed", "error"):
+            st.write(job_payload)
+            return False
+
+        if elapsed_seconds >= timeout_seconds:
+            st.write(f"Stopped waiting locally while {label} is still pending.")
+            st.write(job_payload)
+            return None
+
+        time.sleep(MODEL_POLL_INTERVAL_SECONDS)
+
+
+def fetch_job_results(job_id):
+    response = requests.get(
+        f"{base_url}/jobs/{job_id}/results",
+        headers=headers,
+    )
+
+    if response.status_code != 200:
+        st.write(response.status_code)
+        st.write(response.text)
+        response.raise_for_status()
+
+    return response.json()
+
+
+def download_result_artifact(results_payload):
+    artifact_url = (
+        results_payload.get("inference_results_uri")
+        or results_payload.get("combined_results_uri")
+        or results_payload.get("results_uri")
+    )
+
+    if not artifact_url:
+        return None
+
+    response = requests.get(artifact_url)
+    response.raise_for_status()
+    return response
+
+
+def dataframe_from_result_artifact(results_payload):
+    artifact_response = download_result_artifact(results_payload)
+    if artifact_response is None:
+        data = results_payload.get("data") or results_payload.get("rows") or results_payload.get("results")
+        return dataframe_from_column_oriented_data(data)
+
+    content_type = artifact_response.headers.get("content-type", "")
+    if "application/json" in content_type or artifact_response.text.strip().startswith(("{", "[")):
+        payload = artifact_response.json()
+        return dataframe_from_column_oriented_data(payload.get("data", payload.get("rows", payload)))
+
+    return pd.read_csv(StringIO(artifact_response.text))
+
+
+def run_prediction_inference(model_id, uploaded_file):
+    uploaded_file.seek(0)
+    response = requests.post(
+        f"{base_url}/models/{model_id}/infer-async",
+        headers=headers,
+        files={"file": ("test.csv", uploaded_file, "text/csv")},
+        data={"output_type": "json"},
+    )
+
+    if response.status_code == 404:
+        uploaded_file.seek(0)
+        response = requests.post(
+            f"{base_url}/models/{model_id}/infer",
+            headers=headers,
+            files={"file": ("test.csv", uploaded_file, "text/csv")},
+            data={"output_type": "json"},
+        )
+
+        if response.status_code not in SUCCESS_STATUS_CODES:
+            st.write(response.status_code)
+            st.write(response.text)
+            response.raise_for_status()
+
+        scored_customers, inference_payload = read_inference_json(response)
+        inference_job_id = (
+            inference_payload.get("job_id")
+            or inference_payload.get("inference_job_id")
+            or inference_payload.get("id")
+        )
+        return scored_customers, inference_payload, inference_job_id
+
+    if response.status_code not in SUCCESS_STATUS_CODES:
+        st.write(response.status_code)
+        st.write(response.text)
+        response.raise_for_status()
+
+    inference_job_id = response.json()["job_id"]
+    if not wait_for_job_succeeded(inference_job_id, "prediction inference"):
+        st.error("Prediction inference failed or timed out.")
+        st.stop()
+
+    inference_payload = fetch_job_results(inference_job_id)
+    scored_customers = dataframe_from_result_artifact(inference_payload)
+    return scored_customers, inference_payload, inference_job_id
+
+
+def normalize_explanation_columns(explanations):
+    rename_map = {}
+    for column in explanations.columns:
+        lower_column = column.lower()
+        if lower_column in ("row_id", "row_ids", "input_id", "source_id", "index", "row_index"):
+            rename_map[column] = "id"
+        elif lower_column in ("explanation", "description", "prediction_explanation"):
+            rename_map[column] = "row_prediction_explanation"
+        elif lower_column in ("summary", "explanation_summary"):
+            rename_map[column] = "row_explanation_summary"
+    return explanations.rename(columns=rename_map)
+
+
+def request_row_level_explanation_batch(inference_job_id, row_ids, output_type="json"):
+    response = requests.post(
+        f"{base_url}/jobs/{inference_job_id}/explain",
+        headers=headers,
+        json={
+            "ids": row_ids,
+            "output_type": output_type,
+        },
+    )
+
+    if response.status_code not in SUCCESS_STATUS_CODES:
+        if response.status_code == 404:
+            st.warning(
+                "Row-level explanations are not available for this inference job/API environment, so the app will continue without them."
+            )
+            return None
+
+        st.write(response.status_code)
+        st.write(response.text)
+        response.raise_for_status()
+
+    explanation_job_id = response.json()["job_id"]
+    if not wait_for_job_succeeded(explanation_job_id, "row explanation"):
+        st.warning("Row-level explanation job failed or timed out.")
+        return pd.DataFrame()
+
+    results_payload = fetch_job_results(explanation_job_id)
+    explanations = dataframe_from_result_artifact(results_payload)
+    if explanations.empty:
+        return explanations
+
+    return normalize_explanation_columns(explanations)
+
+
+def get_row_level_explanations(inference_job_id, row_ids, output_type="json"):
+    if not inference_job_id or not row_ids:
+        return pd.DataFrame()
+
+    explanations = request_row_level_explanation_batch(inference_job_id, row_ids, output_type)
+    if explanations is None or explanations.empty or "id" not in explanations.columns:
+        return pd.DataFrame() if explanations is None else explanations
+
+    requested_ids = {normalized_merge_id(row_id) for row_id in row_ids}
+    returned_ids = {normalized_merge_id(row_id) for row_id in explanations["id"].dropna().tolist()}
+    missing_ids = [
+        row_id
+        for row_id in row_ids
+        if normalized_merge_id(row_id) not in returned_ids
+    ]
+
+    if not missing_ids:
+        return explanations
+
+    st.info(
+        f"Explanation batch returned {len(returned_ids)} of {len(requested_ids)} rows. "
+        "Requesting missing rows individually."
+    )
+    explanation_frames = [explanations]
+    for row_id in missing_ids:
+        row_explanation = request_row_level_explanation_batch(
+            inference_job_id,
+            [row_id],
+            output_type,
+        )
+        if row_explanation is not None and not row_explanation.empty:
+            explanation_frames.append(row_explanation)
+
+    combined_explanations = pd.concat(explanation_frames, ignore_index=True)
+    if "id" not in combined_explanations.columns:
+        return combined_explanations
+
+    combined_explanations["_normalized_id"] = combined_explanations["id"].map(normalized_merge_id)
+    return (
+        combined_explanations
+        .drop_duplicates("_normalized_id", keep="last")
+        .drop(columns=["_normalized_id"])
+    )
+
+
+def normalized_merge_id(value):
+    numeric_value = as_number(value)
+    if numeric_value is not None and numeric_value.is_integer():
+        return str(int(numeric_value))
+    return str(value).strip()
+
+
+def explanation_value_columns(explanations):
+    return [
+        column
+        for column in explanations.columns
+        if column != "id"
+        and (
+            "explanation" in column.lower()
+            or "summary" in column.lower()
+            or column == "prediction_class_explanation"
+        )
+    ]
+
+
+def add_row_level_explanations(results, explanations):
+    if explanations.empty:
+        return results
+
+    value_columns = explanation_value_columns(explanations)
+    if not value_columns:
+        return results
+
+    if "id" not in results.columns or "id" not in explanations.columns:
+        return results
+
+    results_for_merge = results.copy()
+    explanations_for_merge = explanations[["id", *value_columns]].copy()
+
+    for column in value_columns:
+        if column in results_for_merge.columns:
+            results_for_merge = results_for_merge.drop(columns=[column])
+
+    results_for_merge["_explanation_merge_id"] = results_for_merge["id"].map(normalized_merge_id)
+    explanations_for_merge["_explanation_merge_id"] = explanations_for_merge["id"].map(normalized_merge_id)
+    explanations_for_merge = explanations_for_merge.drop(columns=["id"])
+
+    return (
+        results_for_merge
+        .merge(explanations_for_merge, on="_explanation_merge_id", how="left")
+        .drop(columns=["_explanation_merge_id"])
+    )
+
+
+PREFERRED_ANALYSIS_COLUMNS = [
+    "AccountAge",
+    "MonthlyCharges",
+    "TotalCharges",
+    "SubscriptionType",
+    "PaymentMethod",
+    "PaperlessBilling",
+    "ContentType",
+    "MultiDeviceAccess",
+    "DeviceRegistered",
+    "ViewingHoursPerWeek",
+    "AverageViewingDuration",
+    "ContentDownloadsPerMonth",
+    "GenrePreference",
+    "UserRating",
+    "SupportTicketsPerMonth",
+    "Gender",
+    "WatchlistSize",
+    "ParentalControl",
+    "SubtitlesEnabled",
+]
+
+
+EXCLUDED_ANALYSIS_COLUMNS = {
+    "id",
+    "customerid",
+    "churn",
+    "prediction",
+    "prediction_prob",
+    "prediction_probability",
+    "probability",
+    "confidence",
+    "prediction_confidence",
+    "score",
+    "prediction_class_explanation",
+    "row_prediction_explanation",
+    "row_explanation_summary",
+}
+
+
+def is_useful_analysis_column(column, series):
+    normalized_column = column.lower()
+    if normalized_column in EXCLUDED_ANALYSIS_COLUMNS:
+        return False
+    if normalized_column.startswith(("factor_", "cluster_", "intervention_")):
+        return False
+
+    non_null = series.dropna()
+    if non_null.empty or non_null.nunique(dropna=True) <= 1:
+        return False
+
+    if pd.api.types.is_numeric_dtype(non_null) or pd.api.types.is_bool_dtype(non_null):
+        return True
+
+    text_values = non_null.astype(str)
+    unique_count = text_values.nunique(dropna=True)
+    unique_ratio = unique_count / max(len(text_values), 1)
+    average_length = text_values.str.len().mean()
+    return unique_count <= 50 and unique_ratio <= 0.8 and average_length <= 80
+
+
+def analysis_dataframe_for_modeling(at_risk):
+    preferred_columns = [
+        column
+        for column in PREFERRED_ANALYSIS_COLUMNS
+        if column in at_risk.columns and is_useful_analysis_column(column, at_risk[column])
+    ]
+    if preferred_columns:
+        return at_risk[preferred_columns].copy(), preferred_columns
+
+    selected_columns = [
+        column
+        for column in at_risk.columns
+        if is_useful_analysis_column(column, at_risk[column])
+    ]
+    return at_risk[selected_columns].copy(), selected_columns
 
 
 def token_vector(text):
@@ -521,6 +1081,23 @@ def probability_series(dataframe):
     return None
 
 
+def sort_by_probability_desc(dataframe):
+    probability_column = probability_sort_column(dataframe)
+    if not probability_column:
+        return dataframe
+
+    sort_values = pd.to_numeric(dataframe[probability_column], errors="coerce")
+    if not sort_values.notna().any():
+        return dataframe
+
+    return (
+        dataframe
+        .assign(_risk_probability_sort=sort_values)
+        .sort_values("_risk_probability_sort", ascending=False)
+        .drop(columns=["_risk_probability_sort"])
+    )
+
+
 def filter_at_risk_customers(scored_customers, churn_confidence_threshold):
     at_risk_customers = scored_customers.copy()
 
@@ -532,7 +1109,7 @@ def filter_at_risk_customers(scored_customers, churn_confidence_threshold):
         st.warning("No probability column was found, so at-risk filtering used only the prediction label.")
         return at_risk_customers
 
-    return at_risk_customers[probabilities >= churn_confidence_threshold]
+    return sort_by_probability_desc(at_risk_customers[probabilities >= churn_confidence_threshold])
 
 
 def parse_cluster_inference(response, expected_rows):
@@ -694,6 +1271,12 @@ def build_interventions(at_risk, factors, cluster_labels, cluster_descriptions):
 if "model_ids" not in st.session_state:
     st.session_state.model_ids = {}
 
+if "pending_model_jobs" not in st.session_state:
+    st.session_state.pending_model_jobs = {}
+
+if "model_wait_timeout_seconds" not in st.session_state:
+    st.session_state.model_wait_timeout_seconds = MODEL_TRAIN_TIMEOUT_SECONDS
+
 if "intervention_catalog" not in st.session_state:
     st.session_state.intervention_catalog = default_intervention_catalog()
 
@@ -730,34 +1313,13 @@ st.markdown(
 st.title("Churn Intervention Studio")
 st.caption("Train a churn model, identify at-risk subscribers, explain the risk drivers, and produce a targeted intervention plan.")
 
-'''
-workflow:
-user uploads historical customer dataset
-(later) use pandas to do some feature engineering, data cleanup (maybe LLM to do feature engineering/selection?)
-train wood wide prediction model on historical customer dataset, input label is churn
-
-user uploads current customer dataset (no churn label)
-run inference using prediction model to discover at-risk customers
-display a list to the user (with probabilities)
-run unsupervised factor analysis or clustering to discover factors/group customers that are at risk
-based on groups, recommend interventions (LLM?)
-display interventions
-
-Next steps:
-Allow user to decide what criteria is needed for intervention (not just the ones that are predicted to churn, but also the ones that are low confidence of not churning)
-What threshold of confidence does the user want? Maybe 55% confidence churn shouldn't be given an intervention
-Use LLM to draft email intervention, discount
-Allow user-established rules (if _% confidence to churn, do this. if this category and _% confidence churn, do whatever.)
-Connect program to database (supabase/databricks) and run churn prediction every time interval -> sales/CEO dashboard 
--> model can retrain itself based on new data (e.g customer just churned)
-'''
-
 with st.sidebar:
     st.header("Inputs")
     if api_key:
         st.success("Wood Wide API key loaded")
     else:
         st.error("Missing WOODWIDE_API_KEY")
+    st.caption(f"API: {base_url}")
 
     training_data = st.file_uploader(
         "Historical customers",
@@ -814,6 +1376,23 @@ with st.sidebar:
         step=0.01,
         help="Customers must meet or exceed this churn probability to be included in the at-risk workflow.",
     )
+    max_row_explanations = st.slider(
+        "Row explanations",
+        min_value=0,
+        max_value=100,
+        value=25,
+        step=5,
+        help="Generate customer-specific prediction explanations for the highest-risk rows. Set to 0 to skip.",
+    )
+    model_wait_timeout_minutes = st.slider(
+        "Model wait timeout",
+        min_value=10,
+        max_value=180,
+        value=min(180, max(10, st.session_state.model_wait_timeout_seconds // 60)),
+        step=10,
+        help="How long this Streamlit run should wait for Woodwide training jobs before pausing. Pending jobs are saved and resumed on rerun.",
+    )
+    st.session_state.model_wait_timeout_seconds = model_wait_timeout_minutes * 60
     show_raw_model_outputs = st.toggle("Show raw model outputs", value=False)
 
     st.divider()
@@ -875,38 +1454,23 @@ if training_data:
         dataset_name = dataset_name_for_upload("historical_customers", training_data)
         dataset_id = get_or_create_dataset(training_data, dataset_name)
 
-    if dataset_name in st.session_state.model_ids:
-        model_id = st.session_state.model_ids[dataset_name]
-        st.success("Reusing trained churn model for this upload.")
-    else:
-        with st.spinner("training churn model", show_time=True):
-            model_name = dataset_name.replace("historical_customers", "churn_prediction", 1)
-            response = requests.post(
-                f"{base_url}/models/train",
-                headers = headers,
-                json = {
-                    "model_name": model_name,
-                    "model_type": "prediction",
-                    "dataset_id": dataset_id,
-                    "label_column": "Churn"
-                }
-            )
-
-            if response.status_code not in SUCCESS_STATUS_CODES:
-                st.write(response.status_code)
-                st.write(response.text)
-                response.raise_for_status()
-
-            model_id = response.json()["model"]["id"]
-
-            if wait_for_model_ready(model_id):
-                st.success("Churn model is ready.")
-                st.session_state.model_ids[dataset_name] = model_id
-            else:
-                st.error("Churn model training failed or timed out.")
-                st.stop()
+    with st.spinner("training churn model", show_time=True):
+        model_id = get_or_start_model_training(
+            st.session_state.model_ids,
+            dataset_name,
+            f"churn:{dataset_name}",
+            "churn",
+            "Churn model is ready.",
+            lambda: train_model(
+                dataset_name.replace("historical_customers", "churn_prediction", 1),
+                "prediction",
+                dataset_id,
+                label_column="Churn",
+            ),
+        )
 
 at_risk = None
+prediction_explanations = pd.DataFrame()
 
 if test_data:
     if not training_data:
@@ -920,22 +1484,34 @@ if test_data:
             unsafe_allow_html=True,
         )
         with st.spinner("identifying at risk customers...", show_time=True):
-            test_data.seek(0)
-            response = requests.post(
-                f"{base_url}/models/{model_id}/infer",
-                headers=headers,
-                files={"file": ("test.csv", test_data, "text/csv")},
-                data={"output_type": "csv"}
-            )
-
-            if response.status_code not in SUCCESS_STATUS_CODES:
-                st.write(response.status_code)
-                st.write(response.text)
-                response.raise_for_status()
-
-            at_risk = read_inference_csv(response)
-            scored_customers = at_risk
+            active_customers = read_uploaded_csv(test_data)
+            scored_customers, inference_payload, inference_job_id = run_prediction_inference(model_id, test_data)
+            scored_customers = add_original_customer_features(scored_customers, active_customers)
+            scored_customers = add_prediction_descriptions(scored_customers, inference_payload)
+            at_risk = scored_customers
             at_risk = filter_at_risk_customers(scored_customers, churn_confidence_threshold)
+
+            if max_row_explanations and inference_job_id and "id" in at_risk.columns:
+                probability_column = probability_sort_column(at_risk)
+                explanation_candidates = at_risk.copy()
+                if probability_column:
+                    explanation_candidates = explanation_candidates.assign(
+                        _explain_sort=pd.to_numeric(
+                            explanation_candidates[probability_column],
+                            errors="coerce",
+                        )
+                    ).sort_values("_explain_sort", ascending=False)
+
+                row_ids = []
+                for row_id in explanation_candidates["id"].head(max_row_explanations).dropna().tolist():
+                    row_id_number = as_number(row_id)
+                    row_ids.append(int(row_id_number) if row_id_number is not None else str(row_id))
+
+                with st.spinner("explaining highest-risk rows...", show_time=True):
+                    prediction_explanations = get_row_level_explanations(inference_job_id, row_ids)
+                    at_risk = add_row_level_explanations(at_risk, prediction_explanations)
+            elif max_row_explanations and not inference_job_id:
+                st.warning("Inference response did not include a job ID, so row-level explanations were skipped.")
 
 if at_risk is not None:
     total_customers = None
@@ -945,11 +1521,12 @@ if at_risk is not None:
     except (ValueError, pd.errors.EmptyDataError):
         total_customers = None
 
-    risk_metric_1, risk_metric_2, risk_metric_3, risk_metric_4 = st.columns(4)
+    risk_metric_1, risk_metric_2, risk_metric_3, risk_metric_4, risk_metric_5 = st.columns(5)
     risk_metric_1.metric("At-risk customers", f"{len(at_risk):,}")
     risk_metric_2.metric("Previewing", f"{min(len(at_risk), preview_row_count):,}")
     risk_metric_3.metric("Active customers", f"{total_customers:,}" if total_customers is not None else "Uploaded")
     risk_metric_4.metric("Threshold", f"{churn_confidence_threshold:.0%}")
+    risk_metric_5.metric("Explained rows", f"{len(prediction_explanations):,}")
 
     at_risk_tab, at_risk_download_tab = st.tabs(["Preview", "Download"])
     with at_risk_tab:
@@ -979,10 +1556,16 @@ if at_risk is not None:
     else:
         st.subheader("3. Risk Drivers")
         st.markdown('<div class="section-note">Factor analysis summarizes why customers are at risk.</div>', unsafe_allow_html=True)
-        risk_csv = dataframe_to_csv_bytes(at_risk)
+        risk_modeling_data, risk_input_columns = analysis_dataframe_for_modeling(at_risk)
+        if risk_modeling_data.empty or not risk_input_columns:
+            st.error("No usable customer feature columns were available for factor analysis.")
+            st.stop()
+
+        st.caption(f"Using {len(risk_input_columns)} customer feature columns for factor analysis and clustering.")
+        risk_csv = dataframe_to_csv_bytes(risk_modeling_data)
         risk_dataset_name = dataset_name_for_dataframe(
             "risk_customers",
-            at_risk,
+            risk_modeling_data,
             dataset_name,
         )
         risk_dataset_id = get_or_create_dataset_from_bytes(
@@ -991,35 +1574,20 @@ if at_risk is not None:
             risk_dataset_name,
         )
 
-        if risk_dataset_name in st.session_state.risk_ids:
-            factor_model_id = st.session_state.risk_ids[risk_dataset_name]
-            st.success("Reusing trained factor analysis model for these at-risk customers.")
-        else:
-            with st.spinner("training factor analysis model", show_time=True):
-                factor_model_name = risk_dataset_name.replace("risk_customers", "factor_analysis", 1)
-                response = requests.post(
-                    f"{base_url}/models/train",
-                    headers=headers,
-                    json={
-                        "model_name": factor_model_name,
-                        "model_type": "factors",
-                        "dataset_id": risk_dataset_id,
-                    },
-                )
-
-                if response.status_code not in SUCCESS_STATUS_CODES:
-                    st.write(response.status_code)
-                    st.write(response.text)
-                    response.raise_for_status()
-
-                factor_model_id = response.json()["model"]["id"]
-
-                if wait_for_model_ready(factor_model_id):
-                    st.success("Factor analysis model is ready.")
-                    st.session_state.risk_ids[risk_dataset_name] = factor_model_id
-                else:
-                    st.error("Factor analysis model training failed or timed out.")
-                    st.stop()
+        with st.spinner("training factor analysis model", show_time=True):
+            factor_model_id = get_or_start_model_training(
+                st.session_state.risk_ids,
+                risk_dataset_name,
+                f"factors:{risk_dataset_name}",
+                "factor analysis",
+                "Factor analysis model is ready.",
+                lambda: train_model(
+                    risk_dataset_name.replace("risk_customers", "factor_analysis", 1),
+                    "factors",
+                    risk_dataset_id,
+                    input_columns=risk_input_columns,
+                ),
+            )
 
         with st.spinner("factoring...", show_time=True):
             response = requests.post(
@@ -1082,35 +1650,20 @@ if at_risk is not None:
 
         st.subheader("4. Customer Segments")
         st.markdown('<div class="section-note">Clustering groups at-risk customers so intervention actions can account for segment context.</div>', unsafe_allow_html=True)
-        if risk_dataset_name in st.session_state.cluster_ids:
-            cluster_model_id = st.session_state.cluster_ids[risk_dataset_name]
-            st.success("Reusing trained clustering model for these at-risk customers.")
-        else:
-            with st.spinner("training clustering model", show_time=True):
-                cluster_model_name = risk_dataset_name.replace("risk_customers", "customer_segments", 1)
-                response = requests.post(
-                    f"{base_url}/models/train",
-                    headers=headers,
-                    json={
-                        "model_name": cluster_model_name,
-                        "model_type": "clustering",
-                        "dataset_id": risk_dataset_id,
-                    },
-                )
-
-                if response.status_code not in SUCCESS_STATUS_CODES:
-                    st.write(response.status_code)
-                    st.write(response.text)
-                    response.raise_for_status()
-
-                cluster_model_id = response.json()["model"]["id"]
-
-                if wait_for_model_ready(cluster_model_id):
-                    st.success("Clustering model is ready.")
-                    st.session_state.cluster_ids[risk_dataset_name] = cluster_model_id
-                else:
-                    st.error("Clustering model training failed or timed out.")
-                    st.stop()
+        with st.spinner("training clustering model", show_time=True):
+            cluster_model_id = get_or_start_model_training(
+                st.session_state.cluster_ids,
+                risk_dataset_name,
+                f"clusters:{risk_dataset_name}",
+                "clustering",
+                "Clustering model is ready.",
+                lambda: train_model(
+                    risk_dataset_name.replace("risk_customers", "customer_segments", 1),
+                    "clustering",
+                    risk_dataset_id,
+                    input_columns=risk_input_columns,
+                ),
+            )
 
         with st.spinner("segmenting at-risk customers...", show_time=True):
             response = requests.post(
@@ -1154,6 +1707,9 @@ if at_risk is not None:
                 "intervention_urgency",
                 "intervention_category",
                 "intervention_action",
+                "row_prediction_explanation",
+                "row_explanation_summary",
+                "prediction_class_explanation",
                 "primary_factor_description",
                 "cluster_label",
                 "intervention_match_source",
