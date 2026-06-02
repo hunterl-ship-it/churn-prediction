@@ -56,7 +56,135 @@ DEFAULT_TEST_DATASET_PATH = os.path.join("datasets", "test.csv")
 LOCAL_CACHE_DIR = ".streamlit_cache"
 LOCAL_CACHE_DB_PATH = os.path.join(LOCAL_CACHE_DIR, "woodwide_jobs.sqlite3")
 
-INTERVENTION_CATALOG = [
+GENERIC_INTERVENTION_CATALOG = [
+    {
+        "name": "High-value retention save",
+        "description": "high value account long tenure important customer severe churn risk renewal retention save",
+        "keywords": ["value", "revenue", "arr", "mrr", "charges", "tenure", "account_age", "CustomerID", "customer_id"],
+        "low": "Send a personalized check-in that reinforces the value the customer has already received.",
+        "medium": "Offer a retention review with a tailored next-best action or account adjustment.",
+        "high": "Route to a high-touch save motion with an owner, deadline, and tailored retention offer.",
+    },
+    {
+        "name": "Pricing and plan fit review",
+        "description": "price sensitivity expensive plan monthly charge cost downgrade budget concern contract renewal",
+        "keywords": ["price", "plan", "monthly", "charge", "cost", "contract", "subscription", "tier"],
+        "low": "Send plan-fit guidance that highlights the best-value option for current usage.",
+        "medium": "Offer a pricing or package review with a lower-friction plan alternative.",
+        "high": "Escalate a save offer with a time-boxed discount, plan adjustment, or renewal incentive.",
+    },
+    {
+        "name": "Billing friction recovery",
+        "description": "billing payment invoice collection friction payment method failed charge renewal blocker",
+        "keywords": ["billing", "payment", "invoice", "pay", "card", "method", "paperless"],
+        "low": "Send a billing reminder with self-service payment update options.",
+        "medium": "Offer billing support and confirm whether payment setup is blocking continued use.",
+        "high": "Create an urgent billing recovery task with support follow-up and save-offer authority.",
+    },
+    {
+        "name": "Engagement recovery",
+        "description": "low usage inactive disengaged low activity low login frequency adoption drop utilization decline",
+        "keywords": ["usage", "activity", "login", "engagement", "active", "utilization", "frequency"],
+        "low": "Send a personalized re-engagement prompt based on the customer's recent activity pattern.",
+        "medium": "Launch a guided activation campaign focused on the most relevant next action.",
+        "high": "Assign an owner to run a rapid re-engagement plan with concrete adoption goals.",
+    },
+    {
+        "name": "Onboarding completion",
+        "description": "onboarding setup activation incomplete early lifecycle setup progress implementation incomplete",
+        "keywords": ["onboarding", "setup", "activation", "implementation", "completed", "started"],
+        "low": "Send a setup checklist with the next incomplete milestone highlighted.",
+        "medium": "Offer guided onboarding support to complete the most important activation steps.",
+        "high": "Schedule an onboarding recovery session and assign a completion owner.",
+    },
+    {
+        "name": "Support recovery",
+        "description": "support tickets unresolved issue service problem complaint technical support frustration help",
+        "keywords": ["support", "ticket", "issue", "case", "complaint", "problem"],
+        "low": "Send a support follow-up with the most likely self-service fix.",
+        "medium": "Escalate open or repeated issues and confirm resolution with the customer.",
+        "high": "Create an urgent support recovery case with a named owner and executive visibility.",
+    },
+    {
+        "name": "Satisfaction recovery",
+        "description": "low satisfaction bad experience unhappy negative nps csat rating sentiment complaint churn risk",
+        "keywords": ["nps", "csat", "rating", "satisfaction", "sentiment", "score", "feedback"],
+        "low": "Ask for targeted feedback and share one immediate improvement path.",
+        "medium": "Run a satisfaction recovery touchpoint with a tailored offer or service action.",
+        "high": "Escalate to a retention owner for a direct save conversation and recovery plan.",
+    },
+    {
+        "name": "Feature adoption enablement",
+        "description": "low feature adoption missing core capability underused features product value education enablement",
+        "keywords": ["feature", "adoption", "module", "capability", "used", "usage_score"],
+        "low": "Send a short enablement tip for the most relevant underused feature.",
+        "medium": "Invite the customer to a guided feature walkthrough tied to their goals.",
+        "high": "Create a focused adoption plan with success milestones and follow-up ownership.",
+    },
+]
+
+
+B2B_SAAS_INTERVENTION_CATALOG = [
+    {
+        "name": "Executive sponsor outreach",
+        "description": "enterprise account high arr executive sponsor missing relationship risk strategic account renewal churn",
+        "keywords": ["arr", "mrr", "enterprise", "company_size", "executive", "sponsor", "account_age", "seats"],
+        "low": "Send a relationship health check that reinforces business outcomes and next steps.",
+        "medium": "Ask the account owner to confirm the executive sponsor and renewal priorities.",
+        "high": "Schedule an executive sponsor touchpoint with a concrete retention plan and success owner.",
+    },
+    {
+        "name": "Product adoption plan",
+        "description": "low product usage low feature adoption low login frequency product usage score adoption risk",
+        "keywords": ["product_usage_score", "features_adopted", "login_frequency", "days_since_last_login", "usage", "adoption"],
+        "low": "Send a targeted adoption tip for the next feature most likely to create value.",
+        "medium": "Offer a product success session focused on usage gaps and team activation.",
+        "high": "Assign customer success to run a 30-day adoption recovery plan with measurable goals.",
+    },
+    {
+        "name": "Onboarding recovery",
+        "description": "onboarding incomplete implementation not completed setup activation early customer lifecycle risk",
+        "keywords": ["onboarding_completed", "onboarding", "implementation", "activation", "setup"],
+        "low": "Send the remaining onboarding checklist and highlight the highest-value next step.",
+        "medium": "Offer a guided onboarding completion session with a customer success manager.",
+        "high": "Escalate to onboarding recovery with a named owner and completion deadline.",
+    },
+    {
+        "name": "Support escalation",
+        "description": "many support tickets unresolved issues customer frustration technical problems service recovery",
+        "keywords": ["support_tickets", "support", "ticket", "case", "issue", "problem"],
+        "low": "Send a support follow-up summarizing recent fixes and self-service resources.",
+        "medium": "Escalate recurring tickets and confirm resolution with the account contact.",
+        "high": "Open an urgent success/support recovery case with account-owner visibility.",
+    },
+    {
+        "name": "Renewal save motion",
+        "description": "contract renewal annual contract month to month renewal risk low retention expansion contraction",
+        "keywords": ["contract_type", "renewal", "annual", "monthly", "arr", "expansion_revenue_pct", "seats"],
+        "low": "Send a renewal value recap that connects usage to business outcomes.",
+        "medium": "Offer a renewal review with plan-fit and adoption recommendations.",
+        "high": "Launch a save motion with commercial flexibility and executive/account-owner follow-up.",
+    },
+    {
+        "name": "NPS recovery",
+        "description": "low nps low csat poor customer sentiment detractor satisfaction recovery churn risk",
+        "keywords": ["nps_score", "csat_avg", "nps", "csat", "satisfaction", "sentiment"],
+        "low": "Ask for focused feedback and acknowledge the most likely experience gap.",
+        "medium": "Schedule a customer success check-in to address satisfaction drivers.",
+        "high": "Escalate detractor recovery to a retention owner with a corrective action plan.",
+    },
+    {
+        "name": "Seat and team expansion review",
+        "description": "seat count company size expansion revenue low seat penetration team growth adoption opportunity",
+        "keywords": ["seats", "company_size", "expansion_revenue_pct", "arr", "team", "users"],
+        "low": "Share team adoption guidance based on current seat usage.",
+        "medium": "Offer a seat and workflow review to identify blocked teams or unused value.",
+        "high": "Build a joint success plan for team adoption, renewal protection, and expansion potential.",
+    },
+]
+
+
+STREAMING_INTERVENTION_CATALOG = [
     {
         "name": "High-value retention save",
         "description": "long account age high total charges loyal subscriber premium plan high lifetime value severe churn risk",
@@ -139,19 +267,118 @@ INTERVENTION_CATALOG = [
     },
 ]
 
+INTERVENTION_TEMPLATE_CATALOGS = {
+    "generic": GENERIC_INTERVENTION_CATALOG,
+    "b2b_saas": B2B_SAAS_INTERVENTION_CATALOG,
+    "streaming": STREAMING_INTERVENTION_CATALOG,
+}
 
-def default_intervention_catalog():
+INTERVENTION_TEMPLATE_LABELS = {
+    "auto": "Auto-detect",
+    "generic": "Generic retention",
+    "b2b_saas": "B2B SaaS",
+    "streaming": "Streaming/media",
+}
+
+DEFAULT_INTERVENTION_TEMPLATE_KEY = "generic"
+
+
+def copied_intervention_catalog(catalog):
     return [
         {
             **intervention,
             "keywords": list(intervention["keywords"]),
         }
-        for intervention in INTERVENTION_CATALOG
+        for intervention in catalog
     ]
 
 
+def default_intervention_catalog(template_key=DEFAULT_INTERVENTION_TEMPLATE_KEY):
+    return copied_intervention_catalog(
+        INTERVENTION_TEMPLATE_CATALOGS.get(
+            template_key,
+            INTERVENTION_TEMPLATE_CATALOGS[DEFAULT_INTERVENTION_TEMPLATE_KEY],
+        )
+    )
+
+
+def intervention_template_label(template_key):
+    return INTERVENTION_TEMPLATE_LABELS.get(template_key, template_key)
+
+
+def intervention_template_score(dataframe, vocabulary):
+    column_text = " ".join(str(column).lower() for column in dataframe.columns)
+    normalized_column_text = " ".join(normalized_column_name(column) for column in dataframe.columns)
+    score = 0
+    for token in vocabulary:
+        normalized_token = normalized_column_name(token)
+        if token.lower() in column_text or normalized_token in normalized_column_text:
+            score += 1
+    return score
+
+
+def detect_intervention_template(dataframe):
+    b2b_saas_score = intervention_template_score(
+        dataframe,
+        [
+            "arr",
+            "mrr",
+            "seats",
+            "contract_type",
+            "company_size",
+            "industry",
+            "nps",
+            "csat",
+            "support_tickets",
+            "onboarding",
+            "executive_sponsor",
+            "product_usage",
+            "features_adopted",
+            "login_frequency",
+            "expansion_revenue",
+        ],
+    )
+    streaming_score = intervention_template_score(
+        dataframe,
+        [
+            "viewing",
+            "watch",
+            "genre",
+            "content",
+            "subscription_type",
+            "downloads",
+            "device",
+            "subtitles",
+            "parental",
+            "user_rating",
+            "watchlist",
+            "streaming",
+        ],
+    )
+
+    if b2b_saas_score >= 4 and b2b_saas_score >= streaming_score + 2:
+        return "b2b_saas"
+    if streaming_score >= 4 and streaming_score >= b2b_saas_score + 2:
+        return "streaming"
+    return DEFAULT_INTERVENTION_TEMPLATE_KEY
+
+
+def resolve_intervention_template(template_choice, detected_template):
+    if template_choice == "auto":
+        return detected_template or DEFAULT_INTERVENTION_TEMPLATE_KEY
+    return template_choice or DEFAULT_INTERVENTION_TEMPLATE_KEY
+
+
+def set_intervention_catalog_template(template_key):
+    st.session_state.intervention_catalog = default_intervention_catalog(template_key)
+    st.session_state.intervention_catalog_template_key = template_key
+    st.session_state.intervention_catalog_editor_version = (
+        st.session_state.get("intervention_catalog_editor_version", 0) + 1
+    )
+
+
 def current_intervention_catalog():
-    return st.session_state.get("intervention_catalog") or INTERVENTION_CATALOG
+    return st.session_state.get("intervention_catalog") or default_intervention_catalog()
 
 
 def intervention_catalog_to_dataframe(catalog):
@@ -194,6 +421,14 @@ def dataframe_to_intervention_catalog(dataframe):
 def find_intervention_by_name(name):
     for intervention in current_intervention_catalog():
         if intervention["name"] == name:
+            return intervention
+    return None
+
+
+def find_first_intervention_by_names(names):
+    for name in names:
+        intervention = find_intervention_by_name(name)
+        if intervention:
             return intervention
     return None
 
@@ -1466,13 +1701,7 @@ def normalize_explanation_columns(explanations):
 
 
 def request_row_level_explanation_batch(inference_job_id, row_ids, output_type="json"):
-    normalized_row_ids = sorted(str(row_id) for row_id in row_ids)
-    cache_key = inference_cache_key(
-        "row_explanations",
-        inference_job_id,
-        ",".join(normalized_row_ids),
-        output_type,
-    )
+    cache_key = row_explanation_cache_key(inference_job_id, row_ids, output_type)
     cached_result = cached_inference_result(cache_key, "row explanation")
     if cached_result is not None:
         explanations, results_payload, explanation_job_id = cached_result
@@ -1522,6 +1751,74 @@ def request_row_level_explanation_batch(inference_job_id, row_ids, output_type="
     return normalize_explanation_columns(explanations)
 
 
+def row_explanation_cache_key(inference_job_id, row_ids, output_type="json"):
+    normalized_row_ids = sorted(str(row_id) for row_id in row_ids)
+    return inference_cache_key(
+        "row_explanations",
+        inference_job_id,
+        ",".join(normalized_row_ids),
+        output_type,
+    )
+
+
+def cached_row_explanation_if_ready(cache_key):
+    cached_job = cache_get_inference_job(cache_key)
+    if not cached_job:
+        return "missing", pd.DataFrame()
+
+    if cached_job.get("status") in READY_STATUSES and cached_job.get("result_csv"):
+        explanations = dataframe_from_cached_csv(cached_job.get("result_csv"))
+        return "succeeded", normalize_explanation_columns(explanations)
+
+    job_id = cached_job.get("job_id")
+    if not job_id:
+        cache_delete_inference_job(cache_key)
+        return "missing", pd.DataFrame()
+
+    status = job_status(job_id)
+    if status in READY_STATUSES:
+        results_payload = fetch_job_results(job_id)
+        explanations = dataframe_from_result_artifact(results_payload)
+        cache_save_inference_job(cache_key, job_id, "succeeded", results_payload, explanations)
+        return "succeeded", normalize_explanation_columns(explanations)
+
+    if status in FAILED_STATUSES:
+        cache_delete_inference_job(cache_key)
+        return "failed", pd.DataFrame()
+
+    cache_save_inference_job(cache_key, job_id, status or "pending")
+    return status or "pending", pd.DataFrame()
+
+
+def start_row_level_explanation_job(inference_job_id, row_ids, output_type="json"):
+    cache_key = row_explanation_cache_key(inference_job_id, row_ids, output_type)
+    status, explanations = cached_row_explanation_if_ready(cache_key)
+    if status == "succeeded" or status in PENDING_STATUSES:
+        return cache_key, status, explanations
+
+    response = requests.post(
+        f"{base_url}/jobs/{inference_job_id}/explain",
+        headers=headers,
+        json={
+            "ids": row_ids,
+            "output_type": output_type,
+        },
+    )
+
+    if response.status_code not in SUCCESS_STATUS_CODES:
+        if response.status_code == 404:
+            st.warning("Row-level explanations are not available for this inference job/API environment.")
+            return cache_key, "unavailable", pd.DataFrame()
+
+        st.write(response.status_code)
+        st.write(response.text)
+        response.raise_for_status()
+
+    explanation_job_id = response.json()["job_id"]
+    cache_save_inference_job(cache_key, explanation_job_id, "pending")
+    return cache_key, "pending", pd.DataFrame()
+
+
 def get_row_level_explanations(inference_job_id, row_ids, output_type="json"):
     if not inference_job_id or not row_ids:
         return pd.DataFrame()
@@ -1554,6 +1851,32 @@ def get_row_level_explanations(inference_job_id, row_ids, output_type="json"):
         )
         if row_explanation is not None and not row_explanation.empty:
             explanation_frames.append(row_explanation)
+
+    combined_explanations = pd.concat(explanation_frames, ignore_index=True)
+    if "id" not in combined_explanations.columns:
+        return combined_explanations
+
+    combined_explanations["_normalized_id"] = combined_explanations["id"].map(normalized_merge_id)
+    return (
+        combined_explanations
+        .drop_duplicates("_normalized_id", keep="last")
+        .drop(columns=["_normalized_id"])
+    )
+
+
+def get_row_level_explanations_individually(inference_job_id, row_ids, output_type="json"):
+    explanation_frames = []
+    for row_id in row_ids:
+        row_explanation = request_row_level_explanation_batch(
+            inference_job_id,
+            [row_id],
+            output_type,
+        )
+        if row_explanation is not None and not row_explanation.empty:
+            explanation_frames.append(row_explanation)
+
+    if not explanation_frames:
+        return pd.DataFrame()
 
     combined_explanations = pd.concat(explanation_frames, ignore_index=True)
     if "id" not in combined_explanations.columns:
@@ -1614,6 +1937,69 @@ def add_row_level_explanations(results, explanations):
         .merge(explanations_for_merge, on="_explanation_merge_id", how="left")
         .drop(columns=["_explanation_merge_id"])
     )
+
+
+def row_explanation_is_missing(row):
+    for column in ("row_prediction_explanation", "row_explanation_summary"):
+        value = row.get(column)
+        if pd.notna(value) and str(value).strip():
+            return False
+    return True
+
+
+def merge_explanation_frames(*frames):
+    non_empty_frames = [
+        frame
+        for frame in frames
+        if frame is not None and not frame.empty
+    ]
+    if not non_empty_frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(non_empty_frames, ignore_index=True)
+    if "id" not in combined.columns:
+        return combined
+
+    combined["_normalized_id"] = combined["id"].map(normalized_merge_id)
+    return (
+        combined
+        .drop_duplicates("_normalized_id", keep="last")
+        .drop(columns=["_normalized_id"])
+    )
+
+
+def stored_manual_explanations(inference_job_id):
+    return st.session_state.manual_explanations_by_job.get(inference_job_id, pd.DataFrame())
+
+
+def store_manual_explanations(inference_job_id, explanations):
+    if explanations is None or explanations.empty:
+        return
+
+    st.session_state.manual_explanations_by_job[inference_job_id] = merge_explanation_frames(
+        stored_manual_explanations(inference_job_id),
+        explanations,
+    )
+
+
+def identity_columns(dataframe):
+    preferred_columns = [
+        "CustomerID",
+        "customer_id",
+        "account_id",
+        "AccountID",
+        "accountid",
+        "id",
+    ]
+    return [column for column in preferred_columns if column in dataframe.columns]
+
+
+def display_id_for_row(row):
+    for column in identity_columns(pd.DataFrame([row])):
+        value = row.get(column)
+        if pd.notna(value) and str(value).strip():
+            return str(value)
+    return str(row.name)
 
 
 PREFERRED_ANALYSIS_COLUMNS = [
@@ -1784,7 +2170,7 @@ def row_signal_score(row, keywords):
     for column, value in row.items():
         text = f"{column} {value}".lower()
         for keyword in keywords:
-            if keyword in text:
+            if str(keyword).lower() in text:
                 numeric_value = as_number(value)
                 if numeric_value is None:
                     score += 1
@@ -1796,23 +2182,56 @@ def row_signal_score(row, keywords):
 def choose_intervention(row, context_text):
     primary_factor_description = str(row.get("primary_factor_description", "")).lower()
     if "billing" in primary_factor_description or "payment" in primary_factor_description:
-        intervention = find_intervention_by_name("Payment friction recovery")
+        intervention = find_first_intervention_by_names(
+            [
+                "Billing friction recovery",
+                "Payment friction recovery",
+                "Pricing and plan fit review",
+            ]
+        )
         if intervention:
             return 1, intervention, "primary factor"
     if "usage" in primary_factor_description or "adoption" in primary_factor_description:
-        intervention = find_intervention_by_name("Viewing engagement boost")
+        intervention = find_first_intervention_by_names(
+            [
+                "Product adoption plan",
+                "Engagement recovery",
+                "Viewing engagement boost",
+                "Feature adoption enablement",
+            ]
+        )
         if intervention:
             return 1, intervention, "primary factor"
     if "support" in primary_factor_description or "experience" in primary_factor_description:
-        intervention = find_intervention_by_name("Support recovery")
+        intervention = find_first_intervention_by_names(
+            [
+                "Support recovery",
+                "Support escalation",
+                "Satisfaction recovery",
+                "Experience quality recovery",
+            ]
+        )
         if intervention:
             return 1, intervention, "primary factor"
     if "value" in primary_factor_description or "qualitative" in primary_factor_description or "insight" in primary_factor_description:
-        intervention = find_intervention_by_name("Content personalization")
+        intervention = find_first_intervention_by_names(
+            [
+                "High-value retention save",
+                "Executive sponsor outreach",
+                "Content personalization",
+                "Pricing and plan fit review",
+            ]
+        )
         if intervention:
             return 1, intervention, "primary factor"
     if "confidence" in primary_factor_description or "risk score" in primary_factor_description:
-        intervention = find_intervention_by_name("High-value retention save")
+        intervention = find_first_intervention_by_names(
+            [
+                "High-value retention save",
+                "Renewal save motion",
+                "Executive sponsor outreach",
+            ]
+        )
         if intervention:
             return 1, intervention, "primary factor"
 
@@ -1978,6 +2397,73 @@ def filter_at_risk_customers(scored_customers, churn_confidence_threshold):
     return sort_by_probability_desc(at_risk_customers[probabilities >= churn_confidence_threshold])
 
 
+def at_risk_display_columns(dataframe):
+    probability_column = probability_sort_column(dataframe)
+    preferred_columns = [
+        probability_column,
+        "row_prediction_explanation",
+        "row_explanation_summary",
+        "prediction_class_explanation",
+        "CustomerID",
+        "customer_id",
+        "account_id",
+        "AccountID",
+        "company_size",
+        "industry",
+        "arr_usd",
+        "product_usage_score",
+        "nps_score",
+        "days_since_last_login",
+        "support_tickets_90d",
+    ]
+
+    display_columns = []
+    for column in preferred_columns:
+        if column and column in dataframe.columns and column not in display_columns:
+            display_columns.append(column)
+
+    remaining_columns = [
+        column
+        for column in dataframe.columns
+        if column not in display_columns
+        and normalized_column_name(column) not in ("prediction", "churn", "churned", "ischurn", "ischurned")
+    ]
+    return [*display_columns, *remaining_columns]
+
+
+def filter_customers_for_search(dataframe, query):
+    if dataframe.empty or not query:
+        return dataframe
+
+    normalized_query = str(query).strip().lower()
+    if not normalized_query:
+        return dataframe
+
+    searchable_columns = identity_columns(dataframe) or dataframe.columns.tolist()
+    search_text = (
+        dataframe[searchable_columns]
+        .astype(str)
+        .agg(" ".join, axis=1)
+        .str.lower()
+    )
+    return dataframe[search_text.str.contains(re.escape(normalized_query), na=False)]
+
+
+def customer_selection_options(dataframe):
+    options = {}
+    if dataframe.empty or "id" not in dataframe.columns:
+        return options
+
+    selectable_dataframe = dataframe[dataframe.apply(row_explanation_is_missing, axis=1)]
+    for _, row in selectable_dataframe.iterrows():
+        label = display_id_for_row(row)
+        probability = risk_probability(row)
+        if probability is not None:
+            label = f"{label} ({probability:.0%})"
+        options[label] = row["id"]
+    return options
+
+
 def parse_cluster_inference_payload(payload, expected_rows, dataframe=None):
     data = payload.get("data", payload)
     cluster_labels = None
@@ -2036,6 +2522,36 @@ def build_factor_metadata(factors):
         }
 
     return metadata
+
+
+def factor_chart_data_for_display(chart_data, max_slices=4, min_share=0.05):
+    if chart_data.empty:
+        return chart_data
+
+    chart_data = chart_data.copy().sort_values("size", ascending=False).reset_index(drop=True)
+    total_size = chart_data["size"].sum()
+    if total_size <= 0:
+        return chart_data
+
+    chart_data["_share"] = chart_data["size"] / total_size
+    keep_mask = (chart_data.index < max_slices) & (chart_data["_share"] >= min_share)
+    kept_rows = chart_data[keep_mask].drop(columns=["_share"])
+    other_rows = chart_data[~keep_mask]
+
+    if other_rows.empty:
+        return kept_rows
+
+    other_size = other_rows["size"].sum()
+    if other_size <= 0:
+        return kept_rows
+
+    return pd.concat(
+        [
+            kept_rows,
+            pd.DataFrame([{"label": "Other", "size": other_size}]),
+        ],
+        ignore_index=True,
+    )
 
 
 def primary_factor_from_row(row, factor_metadata):
@@ -2169,11 +2685,34 @@ else:
 if "model_wait_timeout_seconds" not in st.session_state:
     st.session_state.model_wait_timeout_seconds = MODEL_TRAIN_TIMEOUT_SECONDS
 
+if "intervention_template_choice" not in st.session_state:
+    st.session_state.intervention_template_choice = "auto"
+
+if "last_intervention_template_choice" not in st.session_state:
+    st.session_state.last_intervention_template_choice = st.session_state.intervention_template_choice
+
+if "intervention_catalog_template_key" not in st.session_state:
+    st.session_state.intervention_catalog_template_key = DEFAULT_INTERVENTION_TEMPLATE_KEY
+
+if "intervention_catalog_customized" not in st.session_state:
+    st.session_state.intervention_catalog_customized = False
+
+if "intervention_catalog_editor_version" not in st.session_state:
+    st.session_state.intervention_catalog_editor_version = 0
+
 if "intervention_catalog" not in st.session_state:
-    st.session_state.intervention_catalog = default_intervention_catalog()
+    st.session_state.intervention_catalog = default_intervention_catalog(
+        st.session_state.intervention_catalog_template_key
+    )
 
 if "show_intervention_editor" not in st.session_state:
     st.session_state.show_intervention_editor = False
+
+if "manual_explanations_by_job" not in st.session_state:
+    st.session_state.manual_explanations_by_job = {}
+
+if "manual_explanation_selection_versions" not in st.session_state:
+    st.session_state.manual_explanation_selection_versions = {}
 
 st.markdown(
     """
@@ -2289,6 +2828,39 @@ with st.sidebar:
 
     st.divider()
     st.header("Interventions")
+    detected_intervention_template = DEFAULT_INTERVENTION_TEMPLATE_KEY
+    if training_data:
+        try:
+            detected_intervention_template = detect_intervention_template(read_uploaded_csv(training_data))
+        except (pd.errors.EmptyDataError, UnicodeDecodeError, ValueError):
+            detected_intervention_template = DEFAULT_INTERVENTION_TEMPLATE_KEY
+
+    template_choice = st.selectbox(
+        "Intervention template",
+        list(INTERVENTION_TEMPLATE_LABELS.keys()),
+        format_func=intervention_template_label,
+        key="intervention_template_choice",
+    )
+    resolved_intervention_template = resolve_intervention_template(
+        template_choice,
+        detected_intervention_template,
+    )
+    template_choice_changed = template_choice != st.session_state.last_intervention_template_choice
+    if template_choice_changed:
+        st.session_state.intervention_catalog_customized = False
+
+    if template_choice_changed or (
+        not st.session_state.intervention_catalog_customized
+        and resolved_intervention_template != st.session_state.intervention_catalog_template_key
+    ):
+        set_intervention_catalog_template(resolved_intervention_template)
+
+    st.session_state.last_intervention_template_choice = template_choice
+    intervention_template_caption = f"Using {intervention_template_label(resolved_intervention_template)} defaults"
+    if st.session_state.intervention_catalog_customized:
+        intervention_template_caption = f"Using customized {intervention_template_label(resolved_intervention_template)} interventions"
+    st.caption(intervention_template_caption)
+
     if st.button("Customize interventions", use_container_width=True):
         st.session_state.show_intervention_editor = not st.session_state.show_intervention_editor
 
@@ -2298,7 +2870,7 @@ with st.sidebar:
             use_container_width=True,
             hide_index=True,
             num_rows="dynamic",
-            key="intervention_catalog_editor",
+            key=f"intervention_catalog_editor:{st.session_state.intervention_catalog_editor_version}",
             column_config={
                 "description": st.column_config.TextColumn(width="medium"),
                 "keywords": st.column_config.TextColumn(
@@ -2314,10 +2886,12 @@ with st.sidebar:
         with apply_col:
             if st.button("Apply", use_container_width=True):
                 st.session_state.intervention_catalog = dataframe_to_intervention_catalog(edited_interventions)
+                st.session_state.intervention_catalog_customized = True
                 st.success("Interventions updated.")
         with reset_col:
             if st.button("Reset", use_container_width=True):
-                st.session_state.intervention_catalog = default_intervention_catalog()
+                set_intervention_catalog_template(resolved_intervention_template)
+                st.session_state.intervention_catalog_customized = False
                 st.success("Defaults restored.")
 
     st.divider()
@@ -2412,6 +2986,14 @@ if test_data:
             elif max_row_explanations and not inference_job_id:
                 st.warning("Inference response did not include a job ID, so row-level explanations were skipped.")
 
+            manual_explanations = stored_manual_explanations(inference_job_id)
+            if not manual_explanations.empty:
+                prediction_explanations = merge_explanation_frames(
+                    prediction_explanations,
+                    manual_explanations,
+                )
+                at_risk = add_row_level_explanations(at_risk, prediction_explanations)
+
 if at_risk is not None:
     total_customers = None
     try:
@@ -2429,11 +3011,101 @@ if at_risk is not None:
 
     at_risk_tab, at_risk_download_tab = st.tabs(["Preview", "Download"])
     with at_risk_tab:
-        st.dataframe(
-            at_risk.head(preview_row_count),
-            use_container_width=True,
-            height=460,
-        )
+        top_customer_count = min(max_row_explanations, len(at_risk)) if max_row_explanations else 0
+        most_at_risk = at_risk.head(top_customer_count)
+        remaining_at_risk = at_risk.iloc[top_customer_count:].copy()
+
+        st.subheader("Most At-Risk Customers")
+        if most_at_risk.empty:
+            st.info("Increase Row explanations to show the highest-risk customers here.")
+        else:
+            most_at_risk_columns = at_risk_display_columns(most_at_risk)
+            st.dataframe(
+                most_at_risk[most_at_risk_columns],
+                use_container_width=True,
+                height=min(460, 110 + 36 * len(most_at_risk)),
+            )
+
+        st.subheader("All Other At-Risk Customers")
+        if remaining_at_risk.empty:
+            st.info("There are no additional at-risk customers outside the most at-risk group.")
+        else:
+            search_col, select_col, action_col = st.columns([1.1, 1.5, 0.8])
+            with search_col:
+                customer_search = st.text_input(
+                    "Search customers",
+                    placeholder="Search account or customer ID",
+                    key=f"expanded_customer_search:{inference_job_id}",
+                )
+            filtered_remaining = filter_customers_for_search(remaining_at_risk, customer_search)
+            selection_options = customer_selection_options(filtered_remaining)
+            selection_version = st.session_state.manual_explanation_selection_versions.get(inference_job_id, 0)
+            selection_key = f"expanded_customer_selection:{inference_job_id}:{selection_version}"
+            with select_col:
+                selected_customer_labels = st.multiselect(
+                    "Select customers",
+                    list(selection_options.keys()),
+                    key=selection_key,
+                )
+            with action_col:
+                st.write("")
+                st.write("")
+                explain_clicked = st.button(
+                    "Explain selected",
+                    use_container_width=True,
+                    key=f"explain_expanded_customers:{inference_job_id}",
+                    disabled=not bool(selected_customer_labels),
+                )
+
+            if explain_clicked:
+                selected_row_ids = [
+                    selection_options[label]
+                    for label in selected_customer_labels
+                    if label in selection_options
+                ]
+                normalized_selected_row_ids = []
+                normalized_seen = set()
+                for selected_row_id in selected_row_ids:
+                    row_id_number = as_number(selected_row_id)
+                    normalized_row_id = int(row_id_number) if row_id_number is not None else str(selected_row_id)
+                    normalized_key = normalized_merge_id(normalized_row_id)
+                    if normalized_key in normalized_seen:
+                        continue
+                    normalized_seen.add(normalized_key)
+                    normalized_selected_row_ids.append(normalized_row_id)
+
+                if not normalized_selected_row_ids:
+                    st.warning("Select one or more customers to explain.")
+                else:
+                    with st.spinner("explaining selected customers...", show_time=True):
+                        selected_explanations = get_row_level_explanations_individually(
+                            inference_job_id,
+                            normalized_selected_row_ids,
+                        )
+
+                    if selected_explanations is not None and not selected_explanations.empty:
+                        store_manual_explanations(inference_job_id, selected_explanations)
+                        prediction_explanations = merge_explanation_frames(
+                            prediction_explanations,
+                            stored_manual_explanations(inference_job_id),
+                        )
+                        at_risk = add_row_level_explanations(at_risk, prediction_explanations)
+                        remaining_at_risk = at_risk.iloc[top_customer_count:].copy()
+                        filtered_remaining = filter_customers_for_search(remaining_at_risk, customer_search)
+                        st.session_state.manual_explanation_selection_versions[inference_job_id] = selection_version + 1
+                        st.success(f"Added explanations for {len(normalized_selected_row_ids)} customer(s).")
+                    else:
+                        st.warning("No row-level explanations were returned for the selected customers.")
+
+            if filtered_remaining.empty:
+                st.info("No customers match the current search.")
+            else:
+                expanded_columns = at_risk_display_columns(filtered_remaining)
+                st.dataframe(
+                    filtered_remaining[expanded_columns].head(preview_row_count),
+                    use_container_width=True,
+                    height=460,
+                )
     with at_risk_download_tab:
         st.download_button(
             "Download at-risk customers CSV",
@@ -2561,11 +3233,12 @@ if at_risk is not None:
 
         if chart_rows:
             chart_data = pd.DataFrame(chart_rows)
+            pie_chart_data = factor_chart_data_for_display(chart_data)
             chart_col, detail_col = st.columns([1, 1])
-            fig, ax = plt.subplots()
+            fig, ax = plt.subplots(figsize=(6.5, 5.2))
             ax.pie(
-                chart_data["size"],
-                labels=chart_data["label"],
+                pie_chart_data["size"],
+                labels=pie_chart_data["label"],
                 autopct="%1.1f%%",
             )
             ax.set_title("Captured variance by churn-risk factor")
