@@ -8,6 +8,7 @@ import re
 import math
 import json
 import uuid
+import sqlite3
 from collections import Counter
 from io import StringIO
 from dotenv import load_dotenv
@@ -31,6 +32,14 @@ MODEL_POLL_INTERVAL_SECONDS = 5
 MODEL_TRAIN_TIMEOUT_SECONDS = 30 * 60
 PREVIEW_ROW_COUNT = 1000
 SUCCESS_STATUS_CODES = (200, 201, 202)
+READY_STATUSES = ("ready", "completed", "succeeded", "success")
+FAILED_STATUSES = ("failed", "error")
+PENDING_STATUSES = ("pending", "queued", "running", "processing", "in_progress", "started")
+NO_READY_DATASET_VERSION_TEXT = "No ready dataset version found"
+DEFAULT_TRAIN_DATASET_PATH = os.path.join("datasets", "train.csv")
+DEFAULT_TEST_DATASET_PATH = os.path.join("datasets", "test.csv")
+LOCAL_CACHE_DIR = ".streamlit_cache"
+LOCAL_CACHE_DB_PATH = os.path.join(LOCAL_CACHE_DIR, "woodwide_jobs.sqlite3")
 
 INTERVENTION_CATALOG = [
     {
@@ -174,6 +183,143 @@ def find_intervention_by_name(name):
     return None
 
 
+def local_cache_connection():
+    os.makedirs(LOCAL_CACHE_DIR, exist_ok=True)
+    connection = sqlite3.connect(LOCAL_CACHE_DB_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def init_local_cache():
+    with local_cache_connection() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS datasets (
+                dataset_name TEXT PRIMARY KEY,
+                dataset_id TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ready_models (
+                ready_key TEXT PRIMARY KEY,
+                model_id TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_jobs (
+                pending_key TEXT PRIMARY KEY,
+                model_id TEXT NOT NULL,
+                job_id TEXT,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+
+
+def cache_get_dataset_id(dataset_name):
+    with local_cache_connection() as connection:
+        row = connection.execute(
+            "SELECT dataset_id FROM datasets WHERE dataset_name = ?",
+            (dataset_name,),
+        ).fetchone()
+    return row["dataset_id"] if row else None
+
+
+def cache_save_dataset(dataset_name, dataset_id):
+    if not dataset_id:
+        return
+
+    with local_cache_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO datasets (dataset_name, dataset_id, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(dataset_name) DO UPDATE SET
+                dataset_id = excluded.dataset_id,
+                updated_at = excluded.updated_at
+            """,
+            (dataset_name, dataset_id, time.time()),
+        )
+
+
+def cache_load_ready_models():
+    with local_cache_connection() as connection:
+        rows = connection.execute("SELECT ready_key, model_id FROM ready_models").fetchall()
+    return {row["ready_key"]: row["model_id"] for row in rows}
+
+
+def cache_load_ready_models_with_prefix(prefix):
+    with local_cache_connection() as connection:
+        rows = connection.execute(
+            "SELECT ready_key, model_id FROM ready_models WHERE ready_key LIKE ?",
+            (f"{prefix}%",),
+        ).fetchall()
+    return {row["ready_key"]: row["model_id"] for row in rows}
+
+
+def cache_save_ready_model(ready_key, model_id):
+    if not model_id:
+        return
+
+    with local_cache_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO ready_models (ready_key, model_id, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(ready_key) DO UPDATE SET
+                model_id = excluded.model_id,
+                updated_at = excluded.updated_at
+            """,
+            (ready_key, model_id, time.time()),
+        )
+
+
+def cache_delete_ready_model(ready_key):
+    with local_cache_connection() as connection:
+        connection.execute("DELETE FROM ready_models WHERE ready_key = ?", (ready_key,))
+
+
+def cache_load_pending_jobs():
+    with local_cache_connection() as connection:
+        rows = connection.execute("SELECT pending_key, model_id, job_id FROM pending_jobs").fetchall()
+    return {
+        row["pending_key"]: {
+            "model_id": row["model_id"],
+            "job_id": row["job_id"],
+        }
+        for row in rows
+    }
+
+
+def cache_save_pending_job(pending_key, model_id, job_id):
+    if not model_id:
+        return
+
+    with local_cache_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO pending_jobs (pending_key, model_id, job_id, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(pending_key) DO UPDATE SET
+                model_id = excluded.model_id,
+                job_id = excluded.job_id,
+                updated_at = excluded.updated_at
+            """,
+            (pending_key, model_id, job_id, time.time()),
+        )
+
+
+def cache_delete_pending_job(pending_key):
+    with local_cache_connection() as connection:
+        connection.execute("DELETE FROM pending_jobs WHERE pending_key = ?", (pending_key,))
+
+
 def uploaded_file_hash(uploaded_file):
     return hashlib.sha256(uploaded_file.getvalue()).hexdigest()
 
@@ -232,7 +378,164 @@ def find_dataset_by_name(dataset_name):
 
 
 def dataset_id_from_dataset(dataset):
+    if not isinstance(dataset, dict):
+        return None
+
     return dataset.get("id") or dataset.get("dataset_id")
+
+
+def datasets_from_response_payload(payload):
+    if isinstance(payload, list):
+        return payload
+
+    if not isinstance(payload, dict):
+        return []
+
+    for key in ("datasets", "data", "items", "results"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+
+    return []
+
+
+def dataset_status_value(record):
+    if not isinstance(record, dict):
+        return None
+
+    for key in ("status", "state", "processing_status", "ingestion_status"):
+        value = record.get(key)
+        if isinstance(value, str):
+            return value.lower()
+
+    return None
+
+
+def dataset_version_records(dataset):
+    if not isinstance(dataset, dict):
+        return []
+
+    versions = []
+    for key in ("versions", "dataset_versions"):
+        value = dataset.get(key)
+        if isinstance(value, list):
+            versions.extend(value)
+
+    for key in ("version", "latest_version", "ready_version", "current_version"):
+        value = dataset.get(key)
+        if isinstance(value, dict):
+            versions.append(value)
+
+    return versions
+
+
+def dataset_readiness(dataset):
+    if not isinstance(dataset, dict):
+        return "unknown"
+
+    records = [dataset, *dataset_version_records(dataset)]
+    statuses = [status for status in (dataset_status_value(record) for record in records) if status]
+
+    if any(status in READY_STATUSES for status in statuses):
+        return "ready"
+
+    if any(status in FAILED_STATUSES for status in statuses):
+        return "failed"
+
+    if any(status in PENDING_STATUSES for status in statuses):
+        return "pending"
+
+    if dataset.get("ready_version_id") or dataset.get("current_version_id"):
+        return "ready"
+
+    return "unknown"
+
+
+def fetch_dataset(dataset_id, dataset_name=None):
+    response = requests.get(
+        f"{base_url}/datasets/{dataset_id}",
+        headers=headers,
+    )
+    if response.status_code == 200:
+        payload = response.json()
+        if isinstance(payload, dict) and isinstance(payload.get("dataset"), dict):
+            return payload["dataset"]
+        return payload
+
+    if response.status_code not in (404, 405):
+        st.write(response.status_code)
+        st.write(response.text)
+        response.raise_for_status()
+
+    if dataset_name:
+        return find_dataset_by_name(dataset_name)
+
+    response = requests.get(
+        f"{base_url}/datasets",
+        headers=headers,
+    )
+    response.raise_for_status()
+    for dataset in datasets_from_response_payload(response.json()):
+        if dataset_id_from_dataset(dataset) == dataset_id:
+            return dataset
+
+    return None
+
+
+def wait_for_dataset_ready(
+    dataset_id,
+    dataset_name=None,
+    job_id=None,
+    timeout_seconds=None,
+    allow_unknown_ready=True,
+):
+    if job_id:
+        job_status = wait_for_job_succeeded(job_id, "dataset processing", timeout_seconds)
+        if job_status is not True:
+            return job_status
+
+    started_at = time.monotonic()
+    status_placeholder = st.empty()
+    timeout_seconds = timeout_seconds or current_model_wait_timeout_seconds()
+
+    while True:
+        dataset = fetch_dataset(dataset_id, dataset_name)
+        readiness = dataset_readiness(dataset)
+        elapsed_seconds = int(time.monotonic() - started_at)
+
+        if readiness == "ready":
+            status_placeholder.write(
+                f"Dataset status: ready ({elapsed_seconds // 60}m {elapsed_seconds % 60}s)"
+            )
+            return True
+
+        if readiness == "failed":
+            st.write(dataset)
+            return False
+
+        if readiness == "unknown" and job_id:
+            status_placeholder.write(
+                f"Dataset status: processed ({elapsed_seconds // 60}m {elapsed_seconds % 60}s)"
+            )
+            return True
+
+        if readiness == "unknown" and not dataset:
+            st.write("Dataset could not be found after upload.")
+            return False
+
+        status_placeholder.write(
+            f"Dataset status: {readiness} ({elapsed_seconds // 60}m {elapsed_seconds % 60}s)"
+        )
+
+        if readiness == "unknown" and allow_unknown_ready:
+            return True
+
+        if elapsed_seconds >= timeout_seconds:
+            st.write("Stopped waiting locally while dataset processing is still pending.")
+            st.write(dataset)
+            return None
+
+        time.sleep(MODEL_POLL_INTERVAL_SECONDS)
 
 
 def get_or_create_dataset(uploaded_file, dataset_name):
@@ -245,10 +548,31 @@ def get_or_create_dataset(uploaded_file, dataset_name):
 
 
 def get_or_create_dataset_from_bytes(file_bytes, filename, dataset_name):
+    cached_dataset_id = cache_get_dataset_id(dataset_name)
+    if cached_dataset_id:
+        st.write(f"Reusing cached dataset: {dataset_name}")
+        wait_status = wait_for_dataset_ready(cached_dataset_id, dataset_name)
+        if wait_status is True:
+            return cached_dataset_id
+        if wait_status is False:
+            st.error(f"Dataset processing failed for {dataset_name}.")
+            st.stop()
+        st.warning("Dataset processing is still running. Refresh or rerun the app later to resume.")
+        st.stop()
+
     existing_dataset = find_dataset_by_name(dataset_name)
     if existing_dataset:
         st.write(f"Reusing existing dataset: {dataset_name}")
-        return dataset_id_from_dataset(existing_dataset)
+        dataset_id = dataset_id_from_dataset(existing_dataset)
+        wait_status = wait_for_dataset_ready(dataset_id, dataset_name)
+        if wait_status is True:
+            cache_save_dataset(dataset_name, dataset_id)
+            return dataset_id
+        if wait_status is False:
+            st.error(f"Dataset processing failed for {dataset_name}.")
+            st.stop()
+        st.warning("Dataset processing is still running. Refresh or rerun the app later to resume.")
+        st.stop()
 
     response = requests.post(
         f"{base_url}/datasets",
@@ -262,13 +586,36 @@ def get_or_create_dataset_from_bytes(file_bytes, filename, dataset_name):
             existing_dataset = find_dataset_by_name(dataset_name)
             if existing_dataset:
                 st.write(f"Reusing existing dataset: {dataset_name}")
-                return dataset_id_from_dataset(existing_dataset)
+                dataset_id = dataset_id_from_dataset(existing_dataset)
+                wait_status = wait_for_dataset_ready(dataset_id, dataset_name)
+                if wait_status is True:
+                    cache_save_dataset(dataset_name, dataset_id)
+                    return dataset_id
+                if wait_status is False:
+                    st.error(f"Dataset processing failed for {dataset_name}.")
+                    st.stop()
+                st.warning("Dataset processing is still running. Refresh or rerun the app later to resume.")
+                st.stop()
 
         st.write(response.status_code)
         st.write(response.text)
         response.raise_for_status()
 
-    return response.json()["dataset"]["id"]
+    payload = response.json()
+    dataset_id = dataset_id_from_dataset(payload.get("dataset", {})) or dataset_id_from_dataset(payload)
+    if not dataset_id:
+        st.write(payload)
+        raise ValueError("Dataset creation response did not include a dataset id.")
+
+    wait_status = wait_for_dataset_ready(dataset_id, dataset_name, payload.get("job_id"))
+    if wait_status is True:
+        cache_save_dataset(dataset_name, dataset_id)
+        return dataset_id
+    if wait_status is False:
+        st.error(f"Dataset processing failed for {dataset_name}.")
+        st.stop()
+    st.warning("Dataset processing is still running. Refresh or rerun the app later to resume.")
+    st.stop()
 
 
 def current_model_wait_timeout_seconds():
@@ -313,6 +660,31 @@ def wait_for_model_ready(model_id, timeout_seconds=None):
         time.sleep(MODEL_POLL_INTERVAL_SECONDS)
 
 
+def model_is_ready(model_id):
+    response = requests.get(
+        f"{base_url}/models/{model_id}",
+        headers=headers,
+    )
+
+    if response.status_code != 200:
+        return False
+
+    status = response.json().get("status")
+    return status in READY_STATUSES
+
+
+def model_status(model_id):
+    response = requests.get(
+        f"{base_url}/models/{model_id}",
+        headers=headers,
+    )
+
+    if response.status_code != 200:
+        return None
+
+    return response.json().get("status")
+
+
 def wait_for_training_complete(model_id, job_id):
     if job_id:
         job_status = wait_for_job_succeeded(job_id, "model training")
@@ -339,7 +711,7 @@ def train_model(model_name, model_type, dataset_id, label_column=None, input_col
         json=payload,
     )
 
-    if response.status_code == 409:
+    if response.status_code == 409 and NO_READY_DATASET_VERSION_TEXT not in response.text:
         unique_model_name = f"{model_name}_{uuid.uuid4().hex[:8]}"
         st.warning(f"Model name already exists. Training as {unique_model_name}.")
         payload["model_name"] = unique_model_name
@@ -348,6 +720,22 @@ def train_model(model_name, model_type, dataset_id, label_column=None, input_col
             headers=headers,
             json=payload,
         )
+
+    if response.status_code == 409 and NO_READY_DATASET_VERSION_TEXT in response.text:
+        st.info("Dataset upload is still being prepared for training. Waiting for a ready dataset version.")
+        wait_status = wait_for_dataset_ready(dataset_id, allow_unknown_ready=False)
+        if wait_status is True:
+            response = requests.post(
+                f"{base_url}/models/train",
+                headers=headers,
+                json=payload,
+            )
+        elif wait_status is False:
+            st.error("Dataset processing failed before model training could start.")
+            st.stop()
+        else:
+            st.warning("Dataset processing is still running. Refresh or rerun the app later to resume.")
+            st.stop()
 
     if response.status_code not in SUCCESS_STATUS_CODES:
         st.write(response.status_code)
@@ -368,30 +756,85 @@ def get_or_start_model_training(
 ):
     if ready_key in ready_models:
         model_id = ready_models[ready_key]
-        st.success(f"Reusing trained {training_label} model.")
-        return model_id
+        if model_is_ready(model_id):
+            st.success(f"Reusing trained {training_label} model.")
+            cache_save_ready_model(ready_key, model_id)
+            return model_id
+
+        ready_models.pop(ready_key, None)
+        cache_delete_ready_model(ready_key)
+        st.warning(f"Cached {training_label} model is not ready anymore. Starting or resuming training.")
 
     pending_training = st.session_state.pending_model_jobs.get(pending_key)
     if pending_training:
         model_id = pending_training["model_id"]
         training_job_id = pending_training.get("job_id")
+        status = model_status(model_id)
+        if status in READY_STATUSES:
+            st.success(f"Reusing trained {training_label} model.")
+            ready_models[ready_key] = model_id
+            st.session_state.pending_model_jobs.pop(pending_key, None)
+            cache_save_ready_model(ready_key, model_id)
+            cache_delete_pending_job(pending_key)
+            return model_id
+
+        if status in FAILED_STATUSES:
+            st.session_state.pending_model_jobs.pop(pending_key, None)
+            cache_delete_pending_job(pending_key)
+            st.warning(f"Cached {training_label} model failed. Starting a fresh training job.")
+            model_id, training_job_id = start_training()
+            st.session_state.pending_model_jobs[pending_key] = {
+                "model_id": model_id,
+                "job_id": training_job_id,
+            }
+            cache_save_pending_job(pending_key, model_id, training_job_id)
+
         st.info(f"Resuming wait for existing {training_label} training job.")
+        training_status = wait_for_training_complete(model_id, training_job_id)
+        if training_status is True:
+            st.success(ready_message)
+            ready_models[ready_key] = model_id
+            st.session_state.pending_model_jobs.pop(pending_key, None)
+            cache_save_ready_model(ready_key, model_id)
+            cache_delete_pending_job(pending_key)
+            return model_id
+
+        if training_status is False:
+            st.session_state.pending_model_jobs.pop(pending_key, None)
+            cache_delete_pending_job(pending_key)
+            st.warning(f"Previous {training_label} training job failed. Starting a fresh training job.")
+            model_id, training_job_id = start_training()
+            st.session_state.pending_model_jobs[pending_key] = {
+                "model_id": model_id,
+                "job_id": training_job_id,
+            }
+            cache_save_pending_job(pending_key, model_id, training_job_id)
+        else:
+            st.warning(
+                f"{training_label.title()} model training is still queued or running. "
+                "This is not a failure; refresh or rerun the app later to resume polling the same job."
+            )
+            st.stop()
     else:
         model_id, training_job_id = start_training()
         st.session_state.pending_model_jobs[pending_key] = {
             "model_id": model_id,
             "job_id": training_job_id,
         }
+        cache_save_pending_job(pending_key, model_id, training_job_id)
 
     training_status = wait_for_training_complete(model_id, training_job_id)
     if training_status is True:
         st.success(ready_message)
         ready_models[ready_key] = model_id
         st.session_state.pending_model_jobs.pop(pending_key, None)
+        cache_save_ready_model(ready_key, model_id)
+        cache_delete_pending_job(pending_key)
         return model_id
 
     if training_status is False:
         st.session_state.pending_model_jobs.pop(pending_key, None)
+        cache_delete_pending_job(pending_key)
         st.error(f"{training_label.title()} model training failed.")
         st.stop()
 
@@ -441,6 +884,143 @@ def read_uploaded_csv(uploaded_file):
     dataframe = pd.read_csv(uploaded_file)
     uploaded_file.seek(0)
     return dataframe
+
+
+def normalized_column_name(column):
+    return re.sub(r"[^a-z0-9]+", "", str(column).lower())
+
+
+def is_binary_target_series(series):
+    values = series.dropna()
+    if values.empty:
+        return False
+
+    normalized_values = {
+        re.sub(r"[^a-z0-9]+", "", str(value).lower())
+        for value in values.unique()
+    }
+    if len(normalized_values) > 2:
+        return False
+
+    binary_values = {
+        "0",
+        "1",
+        "false",
+        "true",
+        "f",
+        "t",
+        "no",
+        "yes",
+        "n",
+        "y",
+        "notchurn",
+        "churn",
+        "notchurned",
+        "churned",
+        "retained",
+        "lost",
+    }
+    return normalized_values.issubset(binary_values)
+
+
+def detect_churn_label_column(dataframe):
+    exact_matches = {
+        "churn",
+        "churned",
+        "ischurn",
+        "ischurned",
+        "haschurn",
+        "haschurned",
+        "customerchurn",
+        "customerchurned",
+        "churnlabel",
+        "churntarget",
+    }
+
+    fallback_matches = []
+    for column in dataframe.columns:
+        normalized_column = normalized_column_name(column)
+        if "churn" not in normalized_column:
+            continue
+
+        if normalized_column in exact_matches and is_binary_target_series(dataframe[column]):
+            return column
+
+        if is_binary_target_series(dataframe[column]):
+            fallback_matches.append(column)
+
+    if len(fallback_matches) == 1:
+        return fallback_matches[0]
+
+    return None
+
+
+def churn_label_column_options(dataframe):
+    likely_columns = []
+    other_columns = []
+
+    for column in dataframe.columns:
+        normalized_column = normalized_column_name(column)
+        if "churn" in normalized_column or is_binary_target_series(dataframe[column]):
+            likely_columns.append(column)
+        else:
+            other_columns.append(column)
+
+    return likely_columns + other_columns
+
+
+def get_churn_label_column(dataframe, key):
+    detected_column = detect_churn_label_column(dataframe)
+    if detected_column:
+        return detected_column
+
+    st.warning("I could not confidently identify the churn target column in the training data.")
+    options = churn_label_column_options(dataframe)
+    if not options:
+        st.error("Training data does not contain any columns.")
+        st.stop()
+
+    placeholder = "Select a column"
+    selected_column = st.selectbox(
+        "Which column identifies churn?",
+        [placeholder, *options],
+        key=key,
+        help="Choose the target column the churn model should learn to predict.",
+    )
+    if selected_column == placeholder:
+        st.stop()
+
+    if selected_column and not is_binary_target_series(dataframe[selected_column]):
+        st.info(
+            f'"{selected_column}" does not look like a binary churn column. '
+            "Use it only if this is the target your model should predict."
+        )
+
+    return selected_column
+
+
+def prediction_input_columns_for_training(dataframe, label_column):
+    label_normalized = normalized_column_name(label_column)
+
+    input_columns = []
+    for column in dataframe.columns:
+        normalized_column = normalized_column_name(column)
+        if normalized_column == label_normalized or normalized_column in ("id", "customerid", "customer_id", "accountid", "account_id"):
+            continue
+
+        if "churn" in normalized_column and is_binary_target_series(dataframe[column]):
+            continue
+
+        if dataframe[column].dropna().empty:
+            continue
+
+        input_columns.append(column)
+
+    if not input_columns:
+        st.error("Training data must include at least one non-label feature column.")
+        st.stop()
+
+    return input_columns
 
 
 def add_missing_columns(left, right):
@@ -848,10 +1428,19 @@ EXCLUDED_ANALYSIS_COLUMNS = {
 
 
 def is_useful_analysis_column(column, series):
-    normalized_column = column.lower()
-    if normalized_column in EXCLUDED_ANALYSIS_COLUMNS:
+    lowercase_column = str(column).lower()
+    normalized_column = normalized_column_name(column)
+    normalized_excluded_columns = {
+        normalized_column_name(excluded_column)
+        for excluded_column in EXCLUDED_ANALYSIS_COLUMNS
+    }
+    if lowercase_column in EXCLUDED_ANALYSIS_COLUMNS or normalized_column in normalized_excluded_columns:
         return False
-    if normalized_column.startswith(("factor_", "cluster_", "intervention_")):
+    if "churn" in normalized_column and is_binary_target_series(series):
+        return False
+    if lowercase_column.startswith(("factor_", "cluster_", "intervention_")):
+        return False
+    if normalized_column.startswith(("factor", "cluster", "intervention")):
         return False
 
     non_null = series.dropna()
@@ -1268,11 +1857,23 @@ def build_interventions(at_risk, factors, cluster_labels, cluster_descriptions):
     )
 
 
+init_local_cache()
+
 if "model_ids" not in st.session_state:
-    st.session_state.model_ids = {}
+    st.session_state.model_ids = cache_load_ready_models()
+else:
+    st.session_state.model_ids = {
+        **cache_load_ready_models(),
+        **st.session_state.model_ids,
+    }
 
 if "pending_model_jobs" not in st.session_state:
-    st.session_state.pending_model_jobs = {}
+    st.session_state.pending_model_jobs = cache_load_pending_jobs()
+else:
+    st.session_state.pending_model_jobs = {
+        **cache_load_pending_jobs(),
+        **st.session_state.pending_model_jobs,
+    }
 
 if "model_wait_timeout_seconds" not in st.session_state:
     st.session_state.model_wait_timeout_seconds = MODEL_TRAIN_TIMEOUT_SECONDS
@@ -1335,8 +1936,8 @@ with st.sidebar:
     st.divider()
     st.header("Demo Datasets")
     st.caption("Use these defaults if you do not have client data ready.")
-    if os.path.exists("train.csv"):
-        with open("train.csv", "rb") as file:
+    if os.path.exists(DEFAULT_TRAIN_DATASET_PATH):
+        with open(DEFAULT_TRAIN_DATASET_PATH, "rb") as file:
             st.download_button(
                 "Download default train.csv",
                 file,
@@ -1347,8 +1948,8 @@ with st.sidebar:
     else:
         st.caption("Default train.csv was not found.")
 
-    if os.path.exists("test.csv"):
-        with open("test.csv", "rb") as file:
+    if os.path.exists(DEFAULT_TEST_DATASET_PATH):
+        with open(DEFAULT_TEST_DATASET_PATH, "rb") as file:
             st.download_button(
                 "Download default test.csv",
                 file,
@@ -1450,8 +2051,14 @@ model_id = None
 if training_data:
     st.subheader("1. Churn Model")
     st.markdown('<div class="section-note">Historical data is uploaded once, then reused by content hash on later runs.</div>', unsafe_allow_html=True)
+    training_dataframe = read_uploaded_csv(training_data)
+    dataset_name = dataset_name_for_upload("historical_customers", training_data)
+    churn_label_column = get_churn_label_column(
+        training_dataframe,
+        f"churn_label_column:{dataset_name}",
+    )
+    churn_input_columns = prediction_input_columns_for_training(training_dataframe, churn_label_column)
     with st.spinner("uploading dataset", show_time=True):
-        dataset_name = dataset_name_for_upload("historical_customers", training_data)
         dataset_id = get_or_create_dataset(training_data, dataset_name)
 
     with st.spinner("training churn model", show_time=True):
@@ -1465,7 +2072,8 @@ if training_data:
                 dataset_name.replace("historical_customers", "churn_prediction", 1),
                 "prediction",
                 dataset_id,
-                label_column="Churn",
+                label_column=churn_label_column,
+                input_columns=churn_input_columns,
             ),
         )
 
@@ -1545,10 +2153,20 @@ if at_risk is not None:
         )
 
 if "risk_ids" not in st.session_state:
-    st.session_state.risk_ids = {}
+    st.session_state.risk_ids = cache_load_ready_models_with_prefix("factors:")
+else:
+    st.session_state.risk_ids = {
+        **cache_load_ready_models_with_prefix("factors:"),
+        **st.session_state.risk_ids,
+    }
 
 if "cluster_ids" not in st.session_state:
-    st.session_state.cluster_ids = {}
+    st.session_state.cluster_ids = cache_load_ready_models_with_prefix("clusters:")
+else:
+    st.session_state.cluster_ids = {
+        **cache_load_ready_models_with_prefix("clusters:"),
+        **st.session_state.cluster_ids,
+    }
 
 if at_risk is not None:
     if at_risk.empty:
