@@ -1947,6 +1947,23 @@ def row_explanation_is_missing(row):
     return True
 
 
+def row_prediction_explanation_context(row):
+    context_parts = []
+    for column in ("row_prediction_explanation", "row_explanation_summary"):
+        value = row.get(column)
+        if pd.notna(value) and str(value).strip():
+            context_parts.append(str(value).strip())
+
+    return " ".join(context_parts)
+
+
+def prediction_class_explanation_context(row):
+    value = row.get("prediction_class_explanation")
+    if pd.notna(value) and str(value).strip():
+        return str(value).strip()
+    return ""
+
+
 def merge_explanation_frames(*frames):
     non_empty_frames = [
         frame
@@ -2179,90 +2196,98 @@ def row_signal_score(row, keywords):
     return score
 
 
-def choose_intervention(row, context_text):
-    primary_factor_description = str(row.get("primary_factor_description", "")).lower()
+def primary_factor_intervention_names(primary_factor_description):
+    primary_factor_description = str(primary_factor_description).lower()
     if "billing" in primary_factor_description or "payment" in primary_factor_description:
-        intervention = find_first_intervention_by_names(
-            [
-                "Billing friction recovery",
-                "Payment friction recovery",
-                "Pricing and plan fit review",
-            ]
-        )
-        if intervention:
-            return 1, intervention, "primary factor"
+        return [
+            "Billing friction recovery",
+            "Payment friction recovery",
+            "Pricing and plan fit review",
+        ]
     if "usage" in primary_factor_description or "adoption" in primary_factor_description:
-        intervention = find_first_intervention_by_names(
-            [
-                "Product adoption plan",
-                "Engagement recovery",
-                "Viewing engagement boost",
-                "Feature adoption enablement",
-            ]
-        )
-        if intervention:
-            return 1, intervention, "primary factor"
+        return [
+            "Product adoption plan",
+            "Engagement recovery",
+            "Viewing engagement boost",
+            "Feature adoption enablement",
+        ]
     if "support" in primary_factor_description or "experience" in primary_factor_description:
-        intervention = find_first_intervention_by_names(
-            [
-                "Support recovery",
-                "Support escalation",
-                "Satisfaction recovery",
-                "Experience quality recovery",
-            ]
-        )
-        if intervention:
-            return 1, intervention, "primary factor"
+        return [
+            "Support recovery",
+            "Support escalation",
+            "Satisfaction recovery",
+            "Experience quality recovery",
+        ]
     if "value" in primary_factor_description or "qualitative" in primary_factor_description or "insight" in primary_factor_description:
-        intervention = find_first_intervention_by_names(
-            [
-                "High-value retention save",
-                "Executive sponsor outreach",
-                "Content personalization",
-                "Pricing and plan fit review",
-            ]
-        )
-        if intervention:
-            return 1, intervention, "primary factor"
+        return [
+            "High-value retention save",
+            "Executive sponsor outreach",
+            "Content personalization",
+            "Pricing and plan fit review",
+        ]
     if "confidence" in primary_factor_description or "risk score" in primary_factor_description:
-        intervention = find_first_intervention_by_names(
-            [
-                "High-value retention save",
-                "Renewal save motion",
-                "Executive sponsor outreach",
-            ]
-        )
-        if intervention:
-            return 1, intervention, "primary factor"
+        return [
+            "High-value retention save",
+            "Renewal save motion",
+            "Executive sponsor outreach",
+        ]
+    return []
 
-    semantic_matches = [
-        (
-            cosine_similarity(context_text, intervention["description"]),
-            intervention,
+
+def intervention_match_candidates(row, context_text):
+    primary_factor_description = str(row.get("primary_factor_description", "")).lower()
+    primary_names = set(primary_factor_intervention_names(primary_factor_description))
+    row_explanation_text = row_prediction_explanation_context(row)
+    class_explanation_text = prediction_class_explanation_context(row)
+    candidates = []
+
+    for intervention in current_intervention_catalog():
+        semantic_score = cosine_similarity(context_text, intervention["description"])
+        row_explanation_score = cosine_similarity(row_explanation_text, intervention["description"])
+        class_explanation_score = cosine_similarity(class_explanation_text, intervention["description"])
+        signal_score = row_signal_score(row, intervention["keywords"])
+        signal_weight = min(signal_score, 30) / 10
+        primary_boost = 1.25 if intervention["name"] in primary_names else 0
+        score = semantic_score + (row_explanation_score * 1.6) + (class_explanation_score * 0.5) + signal_weight + primary_boost
+
+        if row_explanation_score > 0:
+            match_source = "row explanation"
+        elif primary_boost > 0:
+            match_source = "primary factor"
+        elif signal_score > 0:
+            match_source = "customer columns"
+        else:
+            match_source = "factor/cluster text"
+
+        candidates.append(
+            {
+                "score": score,
+                "intervention": intervention,
+                "match_source": match_source,
+            }
         )
-        for intervention in current_intervention_catalog()
-    ]
-    best_semantic_score, best_semantic_intervention = max(
-        semantic_matches,
-        key=lambda match: match[0],
+
+    return sorted(candidates, key=lambda candidate: candidate["score"], reverse=True)
+
+
+def choose_intervention(row, context_text, intervention_counts=None):
+    candidates = intervention_match_candidates(row, context_text)
+    if not candidates:
+        raise ValueError("No interventions are configured.")
+
+    if not intervention_counts:
+        best_candidate = candidates[0]
+    else:
+        best_candidate = max(
+            candidates,
+            key=lambda candidate: candidate["score"] / (1 + intervention_counts[candidate["intervention"]["name"]] * 0.55),
+        )
+
+    return (
+        best_candidate["score"],
+        best_candidate["intervention"],
+        best_candidate["match_source"],
     )
-
-    signal_matches = [
-        (
-            row_signal_score(row, intervention["keywords"]),
-            intervention,
-        )
-        for intervention in current_intervention_catalog()
-    ]
-    best_signal_score, best_signal_intervention = max(
-        signal_matches,
-        key=lambda match: match[0],
-    )
-
-    if best_signal_score > 0:
-        return best_signal_score, best_signal_intervention, "customer columns"
-
-    return best_semantic_score, best_semantic_intervention, "factor/cluster text"
 
 
 def risk_probability(row):
@@ -2630,6 +2655,7 @@ def build_interventions(at_risk, factors, cluster_labels, cluster_descriptions):
             result = result.assign(_risk_sort=sort_values).sort_values("_risk_sort", ascending=False)
 
     interventions = []
+    intervention_counts = Counter()
     for row_rank, (_, row) in enumerate(result.iterrows()):
         factor_prefix, factor_description, factor_score = primary_factor_from_row(row, factor_metadata)
         probability = risk_probability(row)
@@ -2641,10 +2667,26 @@ def build_interventions(at_risk, factors, cluster_labels, cluster_descriptions):
         if urgency is None:
             urgency = fallback_urgency_from_rank(row_rank, len(result))
 
-        context = f"{factor_description} {row.get('cluster_description', '')}"
+        explanation_context = row_prediction_explanation_context(row)
+        class_explanation_context = prediction_class_explanation_context(row)
+        context = " ".join(
+            part
+            for part in (
+                factor_description,
+                row.get("cluster_description", ""),
+                explanation_context,
+                class_explanation_context,
+            )
+            if pd.notna(part) and str(part).strip()
+        )
         row_context = row.to_dict()
         row_context["primary_factor_description"] = factor_description
-        match_score, intervention, match_source = choose_intervention(row_context, context)
+        match_score, intervention, match_source = choose_intervention(
+            row_context,
+            context,
+            intervention_counts,
+        )
+        intervention_counts[intervention["name"]] += 1
         interventions.append(
             {
                 "primary_factor": factor_prefix,
