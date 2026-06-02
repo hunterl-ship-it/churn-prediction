@@ -235,6 +235,18 @@ def init_local_cache():
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inference_jobs (
+                cache_key TEXT PRIMARY KEY,
+                job_id TEXT,
+                status TEXT NOT NULL,
+                result_payload_json TEXT,
+                result_csv TEXT,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
 
 
 def cache_get_dataset_id(dataset_name):
@@ -333,6 +345,68 @@ def cache_save_pending_job(pending_key, model_id, job_id):
 def cache_delete_pending_job(pending_key):
     with local_cache_connection() as connection:
         connection.execute("DELETE FROM pending_jobs WHERE pending_key = ?", (pending_key,))
+
+
+def cache_get_inference_job(cache_key):
+    with local_cache_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT cache_key, job_id, status, result_payload_json, result_csv
+            FROM inference_jobs
+            WHERE cache_key = ?
+            """,
+            (cache_key,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def cache_save_inference_job(cache_key, job_id, status, result_payload=None, result_dataframe=None):
+    result_payload_json = json.dumps(result_payload) if result_payload is not None else None
+    result_csv = result_dataframe.to_csv(index=False) if result_dataframe is not None else None
+
+    with local_cache_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO inference_jobs (
+                cache_key,
+                job_id,
+                status,
+                result_payload_json,
+                result_csv,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                job_id = excluded.job_id,
+                status = excluded.status,
+                result_payload_json = COALESCE(excluded.result_payload_json, inference_jobs.result_payload_json),
+                result_csv = COALESCE(excluded.result_csv, inference_jobs.result_csv),
+                updated_at = excluded.updated_at
+            """,
+            (cache_key, job_id, status, result_payload_json, result_csv, time.time()),
+        )
+
+
+def cache_delete_inference_job(cache_key):
+    with local_cache_connection() as connection:
+        connection.execute("DELETE FROM inference_jobs WHERE cache_key = ?", (cache_key,))
+
+
+def dataframe_from_cached_csv(csv_text):
+    if not csv_text:
+        return pd.DataFrame()
+
+    return pd.read_csv(StringIO(csv_text))
+
+
+def payload_from_cached_json(payload_json):
+    if not payload_json:
+        return {}
+
+    try:
+        return json.loads(payload_json)
+    except json.JSONDecodeError:
+        return {}
 
 
 def uploaded_file_hash(uploaded_file):
@@ -1186,6 +1260,18 @@ def fetch_job_results(job_id):
     return response.json()
 
 
+def job_status(job_id):
+    response = requests.get(
+        f"{base_url}/jobs/{job_id}",
+        headers=headers,
+    )
+
+    if response.status_code != 200:
+        return None
+
+    return response.json().get("status")
+
+
 def download_result_artifact(results_payload):
     artifact_url = (
         results_payload.get("inference_results_uri")
@@ -1215,22 +1301,88 @@ def dataframe_from_result_artifact(results_payload):
     return pd.read_csv(StringIO(artifact_response.text))
 
 
-def run_prediction_inference(model_id, uploaded_file):
-    uploaded_file.seek(0)
+def inference_cache_key(kind, *parts):
+    raw_key = ":".join(str(part) for part in (kind, *parts))
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
+def cached_inference_result(cache_key, label):
+    cached_job = cache_get_inference_job(cache_key)
+    if not cached_job:
+        return None
+
+    if cached_job.get("status") in READY_STATUSES and cached_job.get("result_csv"):
+        st.success(f"Reusing cached {label} result.")
+        return (
+            dataframe_from_cached_csv(cached_job.get("result_csv")),
+            payload_from_cached_json(cached_job.get("result_payload_json")),
+            cached_job.get("job_id"),
+        )
+
+    job_id = cached_job.get("job_id")
+    if not job_id:
+        cache_delete_inference_job(cache_key)
+        return None
+
+    status = job_status(job_id)
+    if status in READY_STATUSES:
+        results_payload = fetch_job_results(job_id)
+        result_dataframe = dataframe_from_result_artifact(results_payload)
+        cache_save_inference_job(
+            cache_key,
+            job_id,
+            "succeeded",
+            results_payload,
+            result_dataframe,
+        )
+        st.success(f"Reusing completed {label} job.")
+        return result_dataframe, results_payload, job_id
+
+    if status in FAILED_STATUSES:
+        cache_delete_inference_job(cache_key)
+        return None
+
+    st.info(f"Resuming cached {label} job.")
+    job_completed = wait_for_job_succeeded(job_id, label)
+    if job_completed is True:
+        results_payload = fetch_job_results(job_id)
+        result_dataframe = dataframe_from_result_artifact(results_payload)
+        cache_save_inference_job(
+            cache_key,
+            job_id,
+            "succeeded",
+            results_payload,
+            result_dataframe,
+        )
+        return result_dataframe, results_payload, job_id
+
+    if job_completed is False:
+        cache_delete_inference_job(cache_key)
+        return None
+
+    cache_save_inference_job(cache_key, job_id, status or "pending")
+    st.warning(f"{label.title()} is still queued or running. Refresh or rerun the app later to resume.")
+    st.stop()
+
+
+def run_cached_model_inference(model_id, file_bytes, filename, output_type, cache_key, label):
+    cached_result = cached_inference_result(cache_key, label)
+    if cached_result is not None:
+        return cached_result
+
     response = requests.post(
         f"{base_url}/models/{model_id}/infer-async",
         headers=headers,
-        files={"file": ("test.csv", uploaded_file, "text/csv")},
-        data={"output_type": "json"},
+        files={"file": (filename, file_bytes, "text/csv")},
+        data={"output_type": output_type},
     )
 
     if response.status_code == 404:
-        uploaded_file.seek(0)
         response = requests.post(
             f"{base_url}/models/{model_id}/infer",
             headers=headers,
-            files={"file": ("test.csv", uploaded_file, "text/csv")},
-            data={"output_type": "json"},
+            files={"file": (filename, file_bytes, "text/csv")},
+            data={"output_type": output_type},
         )
 
         if response.status_code not in SUCCESS_STATUS_CODES:
@@ -1238,13 +1390,25 @@ def run_prediction_inference(model_id, uploaded_file):
             st.write(response.text)
             response.raise_for_status()
 
-        scored_customers, inference_payload = read_inference_json(response)
+        if output_type == "json":
+            result_dataframe, result_payload = read_inference_json(response)
+        else:
+            result_dataframe = read_inference_csv(response)
+            result_payload = {"data": result_dataframe.to_dict(orient="records")}
+
         inference_job_id = (
-            inference_payload.get("job_id")
-            or inference_payload.get("inference_job_id")
-            or inference_payload.get("id")
+            result_payload.get("job_id")
+            or result_payload.get("inference_job_id")
+            or result_payload.get("id")
         )
-        return scored_customers, inference_payload, inference_job_id
+        cache_save_inference_job(
+            cache_key,
+            inference_job_id,
+            "succeeded",
+            result_payload,
+            result_dataframe,
+        )
+        return result_dataframe, result_payload, inference_job_id
 
     if response.status_code not in SUCCESS_STATUS_CODES:
         st.write(response.status_code)
@@ -1252,13 +1416,40 @@ def run_prediction_inference(model_id, uploaded_file):
         response.raise_for_status()
 
     inference_job_id = response.json()["job_id"]
-    if not wait_for_job_succeeded(inference_job_id, "prediction inference"):
-        st.error("Prediction inference failed or timed out.")
+    cache_save_inference_job(cache_key, inference_job_id, "pending")
+    if not wait_for_job_succeeded(inference_job_id, label):
+        cache_delete_inference_job(cache_key)
+        st.error(f"{label.title()} failed or timed out.")
         st.stop()
 
     inference_payload = fetch_job_results(inference_job_id)
-    scored_customers = dataframe_from_result_artifact(inference_payload)
-    return scored_customers, inference_payload, inference_job_id
+    result_dataframe = dataframe_from_result_artifact(inference_payload)
+    cache_save_inference_job(
+        cache_key,
+        inference_job_id,
+        "succeeded",
+        inference_payload,
+        result_dataframe,
+    )
+    return result_dataframe, inference_payload, inference_job_id
+
+
+def run_prediction_inference(model_id, uploaded_file):
+    file_bytes = uploaded_file.getvalue()
+    cache_key = inference_cache_key(
+        "prediction",
+        model_id,
+        hashlib.sha256(file_bytes).hexdigest(),
+        "json",
+    )
+    return run_cached_model_inference(
+        model_id,
+        file_bytes,
+        "test.csv",
+        "json",
+        cache_key,
+        "prediction inference",
+    )
 
 
 def normalize_explanation_columns(explanations):
@@ -1275,6 +1466,20 @@ def normalize_explanation_columns(explanations):
 
 
 def request_row_level_explanation_batch(inference_job_id, row_ids, output_type="json"):
+    normalized_row_ids = sorted(str(row_id) for row_id in row_ids)
+    cache_key = inference_cache_key(
+        "row_explanations",
+        inference_job_id,
+        ",".join(normalized_row_ids),
+        output_type,
+    )
+    cached_result = cached_inference_result(cache_key, "row explanation")
+    if cached_result is not None:
+        explanations, results_payload, explanation_job_id = cached_result
+        if explanations.empty:
+            return explanations
+        return normalize_explanation_columns(explanations)
+
     response = requests.post(
         f"{base_url}/jobs/{inference_job_id}/explain",
         headers=headers,
@@ -1296,12 +1501,21 @@ def request_row_level_explanation_batch(inference_job_id, row_ids, output_type="
         response.raise_for_status()
 
     explanation_job_id = response.json()["job_id"]
+    cache_save_inference_job(cache_key, explanation_job_id, "pending")
     if not wait_for_job_succeeded(explanation_job_id, "row explanation"):
+        cache_delete_inference_job(cache_key)
         st.warning("Row-level explanation job failed or timed out.")
         return pd.DataFrame()
 
     results_payload = fetch_job_results(explanation_job_id)
     explanations = dataframe_from_result_artifact(results_payload)
+    cache_save_inference_job(
+        cache_key,
+        explanation_job_id,
+        "succeeded",
+        results_payload,
+        explanations,
+    )
     if explanations.empty:
         return explanations
 
@@ -1487,6 +1701,54 @@ def analysis_dataframe_for_modeling(at_risk):
         if is_useful_analysis_column(column, at_risk[column])
     ]
     return at_risk[selected_columns].copy(), selected_columns
+
+
+def numeric_feature_series(series):
+    non_null = series.dropna()
+    if non_null.empty:
+        return None
+
+    if pd.api.types.is_bool_dtype(non_null):
+        return series.astype("boolean").astype("Int64")
+
+    if pd.api.types.is_numeric_dtype(non_null):
+        numeric_series = pd.to_numeric(series, errors="coerce")
+        return numeric_series if numeric_series.dropna().nunique() > 1 else None
+
+    normalized_values = non_null.astype(str).map(normalized_column_name)
+    binary_map = {
+        "yes": 1,
+        "y": 1,
+        "true": 1,
+        "t": 1,
+        "1": 1,
+        "no": 0,
+        "n": 0,
+        "false": 0,
+        "f": 0,
+        "0": 0,
+    }
+    if normalized_values.isin(binary_map.keys()).all():
+        return series.astype(str).map(lambda value: binary_map.get(normalized_column_name(value)))
+
+    numeric_series = pd.to_numeric(series, errors="coerce")
+    if numeric_series.dropna().nunique() > 1 and numeric_series.notna().sum() == non_null.shape[0]:
+        return numeric_series
+
+    return None
+
+
+def clustering_dataframe_for_modeling(dataframe):
+    cluster_columns = {}
+    for column in dataframe.columns:
+        numeric_series = numeric_feature_series(dataframe[column])
+        if numeric_series is None or numeric_series.dropna().nunique() <= 1:
+            continue
+
+        cluster_columns[column] = numeric_series
+
+    cluster_dataframe = pd.DataFrame(cluster_columns).dropna(axis=1, how="all")
+    return cluster_dataframe.copy(), list(cluster_dataframe.columns)
 
 
 def token_vector(text):
@@ -1716,11 +1978,21 @@ def filter_at_risk_customers(scored_customers, churn_confidence_threshold):
     return sort_by_probability_desc(at_risk_customers[probabilities >= churn_confidence_threshold])
 
 
-def parse_cluster_inference(response, expected_rows):
-    payload = response.json()
+def parse_cluster_inference_payload(payload, expected_rows, dataframe=None):
     data = payload.get("data", payload)
-    cluster_labels = data.get("cluster_label") or data.get("cluster_labels") or data.get("clusters")
-    cluster_descriptions = data.get("cluster_descriptions") or data.get("cluster_description") or {}
+    cluster_labels = None
+    if isinstance(data, dict):
+        cluster_labels = data.get("cluster_label") or data.get("cluster_labels") or data.get("clusters")
+
+    if cluster_labels is None and dataframe is not None:
+        for column in ("cluster_label", "cluster_labels", "clusters"):
+            if column in dataframe.columns:
+                cluster_labels = dataframe[column].tolist()
+                break
+
+    cluster_descriptions = {}
+    if isinstance(data, dict):
+        cluster_descriptions = data.get("cluster_descriptions") or data.get("cluster_description") or {}
 
     if isinstance(cluster_labels, dict):
         sorted_indices = sorted(
@@ -1737,6 +2009,10 @@ def parse_cluster_inference(response, expected_rows):
         labels = labels + [None] * (expected_rows - len(labels))
 
     return labels[:expected_rows], cluster_descriptions
+
+
+def parse_cluster_inference(response, expected_rows):
+    return parse_cluster_inference_payload(response.json(), expected_rows)
 
 
 def build_factor_metadata(factors):
@@ -2194,7 +2470,15 @@ if at_risk is not None:
             st.error("No usable customer feature columns were available for factor analysis.")
             st.stop()
 
-        st.caption(f"Using {len(risk_input_columns)} customer feature columns for factor analysis and clustering.")
+        cluster_modeling_data, cluster_input_columns = clustering_dataframe_for_modeling(risk_modeling_data)
+        if cluster_modeling_data.empty or not cluster_input_columns:
+            st.error("No numeric customer feature columns were available for clustering.")
+            st.stop()
+
+        st.caption(
+            f"Using {len(risk_input_columns)} customer feature columns for factor analysis "
+            f"and {len(cluster_input_columns)} numeric columns for clustering."
+        )
         risk_csv = dataframe_to_csv_bytes(risk_modeling_data)
         risk_dataset_name = dataset_name_for_dataframe(
             "risk_customers",
@@ -2205,6 +2489,17 @@ if at_risk is not None:
             risk_csv,
             "risk_customers.csv",
             risk_dataset_name,
+        )
+        cluster_csv = dataframe_to_csv_bytes(cluster_modeling_data)
+        cluster_dataset_name = dataset_name_for_dataframe(
+            "cluster_customers",
+            cluster_modeling_data,
+            risk_dataset_name,
+        )
+        cluster_dataset_id = get_or_create_dataset_from_bytes(
+            cluster_csv,
+            "cluster_customers.csv",
+            cluster_dataset_name,
         )
 
         with st.spinner("training factor analysis model", show_time=True):
@@ -2223,19 +2518,20 @@ if at_risk is not None:
             )
 
         with st.spinner("factoring...", show_time=True):
-            response = requests.post(
-                f"{base_url}/models/{factor_model_id}/infer",
-                headers=headers,
-                files={"file": ("risk_customers.csv", risk_csv, "text/csv")},
-                data={"output_type": "csv"},
+            factor_cache_key = inference_cache_key(
+                "factor_inference",
+                factor_model_id,
+                hashlib.sha256(risk_csv).hexdigest(),
+                "csv",
             )
-
-            if response.status_code not in SUCCESS_STATUS_CODES:
-                st.write(response.status_code)
-                st.write(response.text)
-                response.raise_for_status()
-
-            factors = read_inference_csv(response)
+            factors, factor_payload, factor_inference_job_id = run_cached_model_inference(
+                factor_model_id,
+                risk_csv,
+                "risk_customers.csv",
+                "csv",
+                factor_cache_key,
+                "factor inference",
+            )
 
         if show_raw_model_outputs:
             st.dataframe(factors, use_container_width=True, height=360)
@@ -2286,32 +2582,38 @@ if at_risk is not None:
         with st.spinner("training clustering model", show_time=True):
             cluster_model_id = get_or_start_model_training(
                 st.session_state.cluster_ids,
-                risk_dataset_name,
-                f"clusters:{risk_dataset_name}",
+                cluster_dataset_name,
+                f"clusters:{cluster_dataset_name}",
                 "clustering",
                 "Clustering model is ready.",
                 lambda: train_model(
-                    risk_dataset_name.replace("risk_customers", "customer_segments", 1),
+                    cluster_dataset_name.replace("cluster_customers", "customer_segments", 1),
                     "clustering",
-                    risk_dataset_id,
-                    input_columns=risk_input_columns,
+                    cluster_dataset_id,
+                    input_columns=cluster_input_columns,
                 ),
             )
 
         with st.spinner("segmenting at-risk customers...", show_time=True):
-            response = requests.post(
-                f"{base_url}/models/{cluster_model_id}/infer",
-                headers=headers,
-                files={"file": ("risk_customers.csv", risk_csv, "text/csv")},
-                data={"output_type": "json"},
+            cluster_cache_key = inference_cache_key(
+                "cluster_inference",
+                cluster_model_id,
+                hashlib.sha256(cluster_csv).hexdigest(),
+                "json",
             )
-
-            if response.status_code not in SUCCESS_STATUS_CODES:
-                st.write(response.status_code)
-                st.write(response.text)
-                response.raise_for_status()
-
-            cluster_labels, cluster_descriptions = parse_cluster_inference(response, len(at_risk))
+            clusters, cluster_payload, cluster_inference_job_id = run_cached_model_inference(
+                cluster_model_id,
+                cluster_csv,
+                "cluster_customers.csv",
+                "json",
+                cluster_cache_key,
+                "cluster inference",
+            )
+            cluster_labels, cluster_descriptions = parse_cluster_inference_payload(
+                cluster_payload,
+                len(at_risk),
+                clusters,
+            )
 
         intervention_results = build_interventions(
             at_risk,
