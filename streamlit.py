@@ -11,8 +11,12 @@ import uuid
 import sqlite3
 from collections import Counter
 from io import StringIO
-from dotenv import load_dotenv
 import matplotlib.pyplot as plt
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
 
 st.set_page_config(
     page_title="Churn Intervention Studio",
@@ -21,12 +25,23 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-load_dotenv()
+if load_dotenv:
+    load_dotenv()
 
 # authentication
 
-api_key = os.getenv("WOODWIDE_API_KEY")
-base_url = os.getenv("WOODWIDE_BASE_URL", "https://api.woodwide.ai").rstrip("/")
+def secret_or_env(name, default=None):
+    value = os.getenv(name)
+    try:
+        value = st.secrets.get(name, value)
+    except Exception:
+        pass
+
+    return value if value else default
+
+
+api_key = secret_or_env("WOODWIDE_API_KEY")
+base_url = secret_or_env("WOODWIDE_BASE_URL", "https://api.woodwide.ai").rstrip("/")
 headers = {"Authorization": f"Bearer {api_key}"}
 MODEL_POLL_INTERVAL_SECONDS = 5
 MODEL_TRAIN_TIMEOUT_SECONDS = 30 * 60
