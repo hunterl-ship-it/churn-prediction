@@ -582,6 +582,70 @@ def cache_delete_pending_job(pending_key):
         connection.execute("DELETE FROM pending_jobs WHERE pending_key = ?", (pending_key,))
 
 
+MODEL_PREDICTION_DESCRIPTIONS_PREFIX = "model_prediction_descriptions:"
+
+
+def cache_save_model_prediction_descriptions(model_id, prediction_descriptions, training_job_id=None):
+    if not model_id or not prediction_descriptions:
+        return
+
+    cache_save_inference_job(
+        f"{MODEL_PREDICTION_DESCRIPTIONS_PREFIX}{model_id}",
+        training_job_id or model_id,
+        "succeeded",
+        {"prediction_descriptions": prediction_descriptions},
+    )
+
+
+def cache_get_model_prediction_descriptions(model_id):
+    if not model_id:
+        return None
+
+    cached_job = cache_get_inference_job(f"{MODEL_PREDICTION_DESCRIPTIONS_PREFIX}{model_id}")
+    if not cached_job:
+        return None
+
+    payload = payload_from_cached_json(cached_job.get("result_payload_json"))
+    return normalize_prediction_descriptions_dict(payload.get("prediction_descriptions"))
+
+
+def cache_get_training_job_id_for_model(model_id):
+    if not model_id:
+        return None
+
+    cached_descriptions_job = cache_get_inference_job(f"{MODEL_PREDICTION_DESCRIPTIONS_PREFIX}{model_id}")
+    if cached_descriptions_job and cached_descriptions_job.get("job_id"):
+        return cached_descriptions_job["job_id"]
+
+    with local_cache_connection() as connection:
+        row = connection.execute(
+            "SELECT job_id FROM pending_jobs WHERE model_id = ? AND job_id IS NOT NULL ORDER BY updated_at DESC LIMIT 1",
+            (model_id,),
+        ).fetchone()
+
+    return row["job_id"] if row else None
+
+
+def cache_training_prediction_descriptions(model_id, training_job_id):
+    if not model_id or not training_job_id:
+        return
+
+    try:
+        training_results = fetch_job_results(training_job_id)
+    except requests.RequestException:
+        return
+
+    prediction_descriptions = normalize_prediction_descriptions_dict(
+        extract_prediction_descriptions_value(training_results)
+    )
+    if prediction_descriptions:
+        cache_save_model_prediction_descriptions(
+            model_id,
+            prediction_descriptions,
+            training_job_id,
+        )
+
+
 def cache_get_inference_job(cache_key):
     with local_cache_connection() as connection:
         row = connection.execute(
@@ -1097,6 +1161,7 @@ def get_or_start_model_training(
         if status in READY_STATUSES:
             st.success(f"Reusing trained {training_label} model.")
             ready_models[ready_key] = model_id
+            cache_training_prediction_descriptions(model_id, training_job_id)
             st.session_state.pending_model_jobs.pop(pending_key, None)
             cache_save_ready_model(ready_key, model_id)
             cache_delete_pending_job(pending_key)
@@ -1118,6 +1183,7 @@ def get_or_start_model_training(
         if training_status is True:
             st.success(ready_message)
             ready_models[ready_key] = model_id
+            cache_training_prediction_descriptions(model_id, training_job_id)
             st.session_state.pending_model_jobs.pop(pending_key, None)
             cache_save_ready_model(ready_key, model_id)
             cache_delete_pending_job(pending_key)
@@ -1151,6 +1217,7 @@ def get_or_start_model_training(
     if training_status is True:
         st.success(ready_message)
         ready_models[ready_key] = model_id
+        cache_training_prediction_descriptions(model_id, training_job_id)
         st.session_state.pending_model_jobs.pop(pending_key, None)
         cache_save_ready_model(ready_key, model_id)
         cache_delete_pending_job(pending_key)
@@ -1402,43 +1469,587 @@ def add_original_customer_features(scored_customers, source_customers):
     return scored_customers
 
 
-def add_prediction_descriptions(scored_customers, inference_payload):
-    prediction_descriptions = inference_payload.get("prediction_descriptions")
-    if not prediction_descriptions and inference_payload.get("descriptions"):
-        try:
-            descriptions = inference_payload["descriptions"]
-            if isinstance(descriptions, str):
-                descriptions = json.loads(descriptions)
-            prediction_descriptions = descriptions.get("prediction_descriptions")
-        except (AttributeError, json.JSONDecodeError):
-            prediction_descriptions = None
+def parse_jsonish_value(value):
+    if isinstance(value, str):
+        stripped_value = value.strip()
+        if stripped_value.startswith(("{", "[")):
+            try:
+                return json.loads(stripped_value)
+            except json.JSONDecodeError:
+                return value
+    return value
 
-    if isinstance(prediction_descriptions, str):
-        try:
-            prediction_descriptions = json.loads(prediction_descriptions)
-        except json.JSONDecodeError:
-            prediction_descriptions = None
 
+def description_from_prediction_payload(payload):
+    payload = parse_jsonish_value(payload)
+    if isinstance(payload, dict):
+        for key in ("description", "explanation", "summary", "text"):
+            value = payload.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return json.dumps(payload)
+    if payload is None:
+        return ""
+    return str(payload)
+
+
+def numeric_weight(value):
+    if isinstance(value, dict):
+        for key in (
+            "weight",
+            "value",
+            "score",
+            "importance",
+            "contribution",
+            "normalized_weight",
+        ):
+            weight = as_number(value.get(key))
+            if weight is not None:
+                return weight
+        return None
+    return as_number(value)
+
+
+def normalized_prediction_label(value):
+    number = as_number(value)
+    if number is not None and float(number).is_integer():
+        return str(int(number))
+    return str(value)
+
+
+def is_positive_churn_label(value):
+    number = as_number(value)
+    if number is not None:
+        return number == 1
+
+    normalized_value = re.sub(r"[^a-z0-9]+", "", str(value).lower())
+    return normalized_value in {"1", "true", "t", "yes", "y", "churn", "churned"}
+
+
+def is_non_churn_label(value):
+    number = as_number(value)
+    if number is not None:
+        return number == 0
+
+    normalized_value = re.sub(r"[^a-z0-9]+", "", str(value).lower())
+    return normalized_value in {"0", "false", "f", "no", "n", "notchurn", "notchurned", "retained"}
+
+
+def parse_descriptions_object(descriptions):
+    descriptions = parse_jsonish_value(descriptions)
+    if isinstance(descriptions, dict):
+        return descriptions
+    return None
+
+
+def download_json_artifact(artifact_url):
+    if not artifact_url:
+        return None
+
+    try:
+        response = requests.get(artifact_url, timeout=30)
+        response.raise_for_status()
+    except requests.RequestException:
+        return None
+
+    if not response.text.strip().startswith(("{", "[")):
+        return None
+
+    try:
+        return response.json()
+    except json.JSONDecodeError:
+        return None
+
+
+def extract_prediction_descriptions_value(payload):
+    if not isinstance(payload, dict):
+        return None
+
+    prediction_descriptions = payload.get("prediction_descriptions")
+    descriptions = parse_descriptions_object(payload.get("descriptions"))
+    if not prediction_descriptions and descriptions:
+        prediction_descriptions = descriptions.get("prediction_descriptions")
+
+    training_results = payload.get("training_results")
+    if not prediction_descriptions and isinstance(training_results, dict):
+        prediction_descriptions = extract_prediction_descriptions_value(training_results)
+
+    return prediction_descriptions
+
+
+def normalize_prediction_descriptions_dict(prediction_descriptions):
+    prediction_descriptions = parse_jsonish_value(prediction_descriptions)
     if isinstance(prediction_descriptions, list):
         prediction_descriptions = {
-            item.get("label", item.get("prediction")): item.get("description", item.get("explanation", ""))
+            item.get("label", item.get("prediction")): item
             for item in prediction_descriptions
             if isinstance(item, dict)
         }
 
     if not isinstance(prediction_descriptions, dict):
-        prediction_descriptions = None
+        return None
+
+    return {
+        normalized_prediction_label(label): payload
+        for label, payload in prediction_descriptions.items()
+    }
+
+
+def prediction_descriptions_from_artifact_urls(payload):
+    for url_key in ("combined_results_uri", "inference_results_uri", "results_uri"):
+        artifact_payload = download_json_artifact(payload.get(url_key))
+        if not artifact_payload:
+            continue
+
+        prediction_descriptions = extract_prediction_descriptions_value(artifact_payload)
+        normalized_descriptions = normalize_prediction_descriptions_dict(prediction_descriptions)
+        if normalized_descriptions:
+            return normalized_descriptions
+
+    return None
+
+
+def prediction_descriptions_from_payload_sources(payload):
+    if not isinstance(payload, dict):
+        return None
+
+    normalized_descriptions = normalize_prediction_descriptions_dict(
+        extract_prediction_descriptions_value(payload)
+    )
+    if normalized_descriptions:
+        return normalized_descriptions
+
+    return prediction_descriptions_from_artifact_urls(payload)
+
+
+def refresh_inference_payload_descriptions(inference_payload, inference_job_id=None):
+    if not isinstance(inference_payload, dict):
+        return inference_payload
+
+    if prediction_descriptions_from_payload_sources(inference_payload):
+        return inference_payload
+
+    if not inference_job_id:
+        return inference_payload
+
+    try:
+        fresh_payload = fetch_job_results(inference_job_id)
+    except requests.RequestException:
+        return inference_payload
+
+    if not isinstance(fresh_payload, dict):
+        return inference_payload
+
+    merged_payload = dict(inference_payload)
+    for key in ("descriptions", "prediction_descriptions", "training_results"):
+        if fresh_payload.get(key) is not None:
+            merged_payload[key] = fresh_payload[key]
+
+    for url_key in ("combined_results_uri", "inference_results_uri", "results_uri"):
+        if fresh_payload.get(url_key) and not merged_payload.get(url_key):
+            merged_payload[url_key] = fresh_payload[url_key]
+
+    return merged_payload
+
+
+def prediction_descriptions_for_model_run(inference_payload, inference_job_id=None, model_id=None):
+    refreshed_payload = refresh_inference_payload_descriptions(inference_payload, inference_job_id)
+    prediction_descriptions = prediction_descriptions_from_payload_sources(refreshed_payload)
+    if prediction_descriptions:
+        return prediction_descriptions
+
+    if model_id:
+        cached_descriptions = cache_get_model_prediction_descriptions(model_id)
+        if cached_descriptions:
+            return cached_descriptions
+
+        training_job_id = cache_get_training_job_id_for_model(model_id)
+        if training_job_id:
+            cache_training_prediction_descriptions(model_id, training_job_id)
+            cached_descriptions = cache_get_model_prediction_descriptions(model_id)
+            if cached_descriptions:
+                return cached_descriptions
+
+    return None
+
+
+def prediction_descriptions_from_inference_payload(inference_payload):
+    return prediction_descriptions_for_model_run(inference_payload)
+
+
+def feature_entries_by_label_from_descriptions(prediction_descriptions):
+    if not prediction_descriptions:
+        return {}
+
+    return {
+        label: feature_weight_entries_from_prediction_payload(payload)
+        for label, payload in prediction_descriptions.items()
+    }
+
+
+def churn_class_label_from_dataframe(dataframe):
+    if dataframe is None or dataframe.empty or "prediction" not in dataframe.columns:
+        return "1"
+
+    labels = [
+        normalized_prediction_label(label)
+        for label in dataframe["prediction"].dropna().unique()
+    ]
+    positive_labels = [
+        label
+        for label in labels
+        if is_positive_churn_label(label)
+    ]
+    if len(positive_labels) == 1:
+        return positive_labels[0]
+
+    non_churn_labels = {
+        label
+        for label in labels
+        if is_non_churn_label(label)
+    }
+    churn_labels = [label for label in labels if label not in non_churn_labels]
+    if len(churn_labels) == 1:
+        return churn_labels[0]
+
+    return "1"
+
+
+def feature_weight_entries_from_value(value):
+    value = parse_jsonish_value(value)
+    entries = []
+
+    if isinstance(value, dict):
+        feature_name = None
+        for feature_key in ("feature", "feature_name", "name", "column", "field"):
+            if feature_key in value:
+                feature_name = str(value[feature_key])
+                break
+
+        weight = numeric_weight(value)
+        if feature_name is not None and weight is not None:
+            return [(feature_name, weight)]
+
+        for key, weight_value in value.items():
+            weight = numeric_weight(weight_value)
+            if weight is not None:
+                entries.append((str(key), weight))
+        return entries
+
+    if isinstance(value, list):
+        for item in value:
+            entries.extend(feature_weight_entries_from_value(item))
+
+    return entries
+
+
+def feature_weight_entries_from_prediction_payload(payload):
+    payload = parse_jsonish_value(payload)
+    if isinstance(payload, dict):
+        for key in (
+            "feature_weights",
+            "featureWeights",
+            "weights",
+            "feature_importances",
+            "featureImportances",
+            "feature_contributions",
+            "featureContributions",
+            "features",
+        ):
+            if key in payload:
+                return feature_weight_entries_from_value(payload[key])
+        return feature_weight_entries_from_value(payload)
+
+    return feature_weight_entries_from_value(payload)
+
+
+def format_feature_weight(feature, weight):
+    return f"{feature} ({weight:+.3g})"
+
+
+def feature_weight_summary(entries, direction="positive", limit=3):
+    if direction == "positive":
+        selected_entries = [entry for entry in entries if entry[1] > 0]
+        selected_entries = sorted(selected_entries, key=lambda entry: entry[1], reverse=True)
+    elif direction == "negative":
+        selected_entries = [entry for entry in entries if entry[1] < 0]
+        selected_entries = sorted(selected_entries, key=lambda entry: entry[1])
+    else:
+        selected_entries = sorted(entries, key=lambda entry: abs(entry[1]), reverse=True)
+
+    return ", ".join(
+        format_feature_weight(feature, weight)
+        for feature, weight in selected_entries[:limit]
+    )
+
+
+def feature_weight_context_from_entries(entries, limit=5):
+    if not entries:
+        return ""
+
+    strongest_entries = sorted(entries, key=lambda entry: abs(entry[1]), reverse=True)[:limit]
+    context_parts = []
+    for feature, weight in strongest_entries:
+        if weight > 0:
+            context_parts.append(f"churn risk driver {feature} positive feature weight {weight:.3g}")
+        elif weight < 0:
+            context_parts.append(f"protective driver {feature} negative feature weight {weight:.3g}")
+    return " ".join(context_parts)
+
+
+def driver_group_for_feature(feature):
+    normalized_feature = normalized_column_name(feature)
+    if any(token in normalized_feature for token in ("usage", "login", "activity", "adoption", "feature", "utilization")):
+        return "Usage/adoption"
+    if any(token in normalized_feature for token in ("nps", "csat", "rating", "satisfaction", "sentiment", "feedback")):
+        return "Satisfaction"
+    if any(token in normalized_feature for token in ("support", "ticket", "case", "issue")):
+        return "Support friction"
+    if any(token in normalized_feature for token in ("contract", "arr", "mrr", "revenue", "seat", "price", "charge", "plan", "subscription")):
+        return "Commercial/renewal"
+    if any(token in normalized_feature for token in ("onboarding", "setup", "implementation", "activation")):
+        return "Onboarding"
+    if any(token in normalized_feature for token in ("billing", "payment", "invoice", "card")):
+        return "Billing"
+    if any(token in normalized_feature for token in ("view", "watch", "genre", "content", "download", "device")):
+        return "Content engagement"
+    return "Other"
+
+
+def row_value_for_feature(row, feature):
+    if feature in row.index:
+        value = row.get(feature)
+        return "" if pd.isna(value) else value
+
+    normalized_feature = normalized_column_name(feature)
+    for column in row.index:
+        if normalized_column_name(column) == normalized_feature:
+            value = row.get(column)
+            return "" if pd.isna(value) else value
+
+    return ""
+
+
+def model_risk_driver_summary_for_row(row, entries, limit=3):
+    positive_entries = sorted(
+        [entry for entry in entries if entry[1] > 0],
+        key=lambda entry: entry[1],
+        reverse=True,
+    )
+    if not positive_entries:
+        return ""
+
+    driver_parts = []
+    for feature, weight in positive_entries[:limit]:
+        group = driver_group_for_feature(feature)
+        value = row_value_for_feature(row, feature)
+        if value != "":
+            driver_parts.append(f"{group}: {feature}={value} ({weight:+.3g})")
+        else:
+            driver_parts.append(f"{group}: {feature} ({weight:+.3g})")
+    return "; ".join(driver_parts)
+
+
+def parse_feature_weight_summary(summary):
+    entries = []
+    for part in str(summary or "").split(","):
+        match = re.match(r"\s*(.*?)\s*\(([+-]?[0-9.eE-]+)\)\s*$", part)
+        if not match:
+            continue
+
+        weight = as_number(match.group(2))
+        if weight is not None:
+            entries.append((match.group(1), weight))
+    return entries
+
+
+def risk_driver_chart_data(dataframe):
+    if dataframe is None or dataframe.empty or "top_churn_drivers" not in dataframe.columns:
+        return pd.DataFrame()
+
+    driver_rows = []
+    for summary in dataframe["top_churn_drivers"].dropna():
+        summary_text = str(summary).strip()
+        if not summary_text:
+            continue
+        for feature, weight in parse_feature_weight_summary(summary_text):
+            if weight <= 0:
+                continue
+            driver_rows.append(
+                {
+                    "driver": driver_group_for_feature(feature),
+                    "feature": feature,
+                    "weighted_signal": abs(weight),
+                    "customers": 1,
+                }
+            )
+
+    if not driver_rows:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(driver_rows)
+        .groupby(["driver", "feature"], as_index=False)
+        .agg(weighted_signal=("weighted_signal", "sum"), customers=("customers", "sum"))
+        .sort_values("weighted_signal", ascending=False)
+    )
+
+
+def risk_driver_chart_data_from_feature_entries(feature_entries_by_label, at_risk):
+    if not feature_entries_by_label or at_risk is None or at_risk.empty:
+        return pd.DataFrame()
+
+    churn_label = churn_class_label_from_dataframe(at_risk)
+    entries = feature_entries_by_label.get(churn_label, [])
+    if not entries:
+        for label, label_entries in feature_entries_by_label.items():
+            if is_positive_churn_label(label):
+                entries = label_entries
+                churn_label = label
+                break
+
+    if not entries:
+        return pd.DataFrame()
+
+    customer_count = len(at_risk)
+    driver_rows = []
+    for feature, weight in entries:
+        if weight <= 0:
+            continue
+        driver_rows.append(
+            {
+                "driver": driver_group_for_feature(feature),
+                "feature": feature,
+                "weighted_signal": abs(weight) * customer_count,
+                "customers": customer_count,
+            }
+        )
+
+    if not driver_rows:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(driver_rows)
+        .groupby(["driver", "feature"], as_index=False)
+        .agg(weighted_signal=("weighted_signal", "sum"), customers=("customers", "sum"))
+        .sort_values("weighted_signal", ascending=False)
+    )
+
+
+def risk_driver_chart_data_from_feature_contrast(at_risk, scored_customers):
+    if (
+        at_risk is None
+        or scored_customers is None
+        or at_risk.empty
+        or scored_customers.empty
+    ):
+        return pd.DataFrame()
+
+    at_risk_modeling_data, feature_columns = analysis_dataframe_for_modeling(at_risk)
+    if at_risk_modeling_data.empty or not feature_columns:
+        return pd.DataFrame()
+
+    if "prediction" in scored_customers.columns:
+        retained_customers = scored_customers[
+            ~scored_customers["prediction"].map(is_positive_churn_label)
+        ]
+    else:
+        probability_column = probability_sort_column(scored_customers)
+        if probability_column:
+            probabilities = pd.to_numeric(scored_customers[probability_column], errors="coerce")
+            retained_customers = scored_customers[probabilities < 0.5]
+        else:
+            retained_customers = scored_customers
+
+    retained_modeling_data, _ = analysis_dataframe_for_modeling(retained_customers)
+    driver_rows = []
+    for feature in feature_columns:
+        if feature not in retained_modeling_data.columns:
+            continue
+
+        at_risk_values = pd.to_numeric(at_risk_modeling_data[feature], errors="coerce").dropna()
+        retained_values = pd.to_numeric(retained_modeling_data[feature], errors="coerce").dropna()
+        if at_risk_values.empty or retained_values.empty:
+            continue
+
+        effect_size = abs(at_risk_values.mean() - retained_values.mean())
+        pooled_std = pd.concat([at_risk_values, retained_values]).std()
+        if pooled_std and pooled_std > 0:
+            signal = effect_size / pooled_std
+        else:
+            signal = effect_size
+
+        if signal <= 0:
+            continue
+
+        driver_rows.append(
+            {
+                "driver": driver_group_for_feature(feature),
+                "feature": feature,
+                "weighted_signal": signal * len(at_risk),
+                "customers": len(at_risk),
+            }
+        )
+
+    if not driver_rows:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(driver_rows)
+        .groupby(["driver", "feature"], as_index=False)
+        .agg(weighted_signal=("weighted_signal", "sum"), customers=("customers", "sum"))
+        .sort_values("weighted_signal", ascending=False)
+    )
+
+
+def add_prediction_descriptions(
+    scored_customers,
+    inference_payload,
+    inference_job_id=None,
+    model_id=None,
+):
+    prediction_descriptions = prediction_descriptions_for_model_run(
+        inference_payload,
+        inference_job_id,
+        model_id,
+    )
+    feature_entries_by_label = feature_entries_by_label_from_descriptions(prediction_descriptions)
+    st.session_state.churn_feature_entries_by_label = feature_entries_by_label
 
     if not prediction_descriptions or "prediction" not in scored_customers.columns:
         return scored_customers
 
-    descriptions_by_label = {
-        str(label): description
-        for label, description in prediction_descriptions.items()
-    }
+    payloads_by_label = prediction_descriptions
     scored_customers = scored_customers.copy()
     scored_customers["prediction_class_explanation"] = scored_customers["prediction"].map(
-        lambda prediction: descriptions_by_label.get(str(prediction), "")
+        lambda prediction: description_from_prediction_payload(
+            payloads_by_label.get(normalized_prediction_label(prediction), "")
+        )
+    )
+
+    scored_customers["top_churn_drivers"] = scored_customers["prediction"].map(
+        lambda prediction: feature_weight_summary(
+            feature_entries_by_label.get(normalized_prediction_label(prediction), []),
+            "positive",
+        )
+    )
+    scored_customers["top_protective_drivers"] = scored_customers["prediction"].map(
+        lambda prediction: feature_weight_summary(
+            feature_entries_by_label.get(normalized_prediction_label(prediction), []),
+            "negative",
+        )
+    )
+    scored_customers["feature_weight_context"] = scored_customers["prediction"].map(
+        lambda prediction: feature_weight_context_from_entries(
+            feature_entries_by_label.get(normalized_prediction_label(prediction), [])
+        )
+    )
+    scored_customers["model_risk_drivers"] = scored_customers.apply(
+        lambda row: model_risk_driver_summary_for_row(
+            row,
+            feature_entries_by_label.get(normalized_prediction_label(row.get("prediction")), []),
+        ),
+        axis=1,
     )
     return scored_customers
 
@@ -1964,6 +2575,15 @@ def prediction_class_explanation_context(row):
     return ""
 
 
+def feature_weight_context(row):
+    context_parts = []
+    for column in ("model_risk_drivers", "top_churn_drivers", "feature_weight_context"):
+        value = row.get(column)
+        if pd.notna(value) and str(value).strip():
+            context_parts.append(str(value).strip())
+    return " ".join(context_parts)
+
+
 def merge_explanation_frames(*frames):
     non_empty_frames = [
         frame
@@ -2039,6 +2659,23 @@ PREFERRED_ANALYSIS_COLUMNS = [
     "WatchlistSize",
     "ParentalControl",
     "SubtitlesEnabled",
+    "arr_usd",
+    "mrr_usd",
+    "seats",
+    "company_size",
+    "industry",
+    "contract_type",
+    "account_age_months",
+    "product_usage_score",
+    "features_adopted_pct",
+    "login_frequency_monthly",
+    "days_since_last_login",
+    "support_tickets_90d",
+    "nps_score",
+    "csat_avg",
+    "expansion_revenue_pct",
+    "has_executive_sponsor",
+    "onboarding_completed",
 ]
 
 
@@ -2056,6 +2693,10 @@ EXCLUDED_ANALYSIS_COLUMNS = {
     "prediction_class_explanation",
     "row_prediction_explanation",
     "row_explanation_summary",
+    "model_risk_drivers",
+    "top_churn_drivers",
+    "top_protective_drivers",
+    "feature_weight_context",
 }
 
 
@@ -2239,18 +2880,29 @@ def intervention_match_candidates(row, context_text):
     primary_names = set(primary_factor_intervention_names(primary_factor_description))
     row_explanation_text = row_prediction_explanation_context(row)
     class_explanation_text = prediction_class_explanation_context(row)
+    feature_weight_text = feature_weight_context(row)
     candidates = []
 
     for intervention in current_intervention_catalog():
         semantic_score = cosine_similarity(context_text, intervention["description"])
         row_explanation_score = cosine_similarity(row_explanation_text, intervention["description"])
         class_explanation_score = cosine_similarity(class_explanation_text, intervention["description"])
+        feature_weight_score = cosine_similarity(feature_weight_text, intervention["description"])
         signal_score = row_signal_score(row, intervention["keywords"])
         signal_weight = min(signal_score, 30) / 10
         primary_boost = 1.25 if intervention["name"] in primary_names else 0
-        score = semantic_score + (row_explanation_score * 1.6) + (class_explanation_score * 0.5) + signal_weight + primary_boost
+        score = (
+            semantic_score
+            + (row_explanation_score * 1.6)
+            + (feature_weight_score * 2.0)
+            + (class_explanation_score * 0.5)
+            + signal_weight
+            + primary_boost
+        )
 
-        if row_explanation_score > 0:
+        if feature_weight_score > 0:
+            match_source = "feature weights"
+        elif row_explanation_score > 0:
             match_source = "row explanation"
         elif primary_boost > 0:
             match_source = "primary factor"
@@ -2270,17 +2922,30 @@ def intervention_match_candidates(row, context_text):
     return sorted(candidates, key=lambda candidate: candidate["score"], reverse=True)
 
 
-def choose_intervention(row, context_text, intervention_counts=None):
+def choose_intervention(row, context_text, intervention_counts=None, cluster_intervention_counts=None):
     candidates = intervention_match_candidates(row, context_text)
     if not candidates:
         raise ValueError("No interventions are configured.")
 
-    if not intervention_counts:
+    if not intervention_counts and not cluster_intervention_counts:
         best_candidate = candidates[0]
     else:
+        cluster_label = str(row.get("cluster_label", ""))
+
+        def diversified_score(candidate):
+            intervention_name = candidate["intervention"]["name"]
+            global_count = intervention_counts[intervention_name] if intervention_counts else 0
+            cluster_count = (
+                cluster_intervention_counts[(cluster_label, intervention_name)]
+                if cluster_intervention_counts and cluster_label
+                else 0
+            )
+            diversity_penalty = 1 + (global_count * 0.45) + (cluster_count * 0.35)
+            return candidate["score"] / diversity_penalty
+
         best_candidate = max(
             candidates,
-            key=lambda candidate: candidate["score"] / (1 + intervention_counts[candidate["intervention"]["name"]] * 0.55),
+            key=diversified_score,
         )
 
     return (
@@ -2412,7 +3077,9 @@ def filter_at_risk_customers(scored_customers, churn_confidence_threshold):
     at_risk_customers = scored_customers.copy()
 
     if "prediction" in at_risk_customers.columns:
-        at_risk_customers = at_risk_customers[at_risk_customers["prediction"] == 1]
+        at_risk_customers = at_risk_customers[
+            at_risk_customers["prediction"].map(is_positive_churn_label)
+        ]
 
     probabilities = probability_series(at_risk_customers)
     if probabilities is None:
@@ -2426,6 +3093,8 @@ def at_risk_display_columns(dataframe):
     probability_column = probability_sort_column(dataframe)
     preferred_columns = [
         probability_column,
+        "model_risk_drivers",
+        "top_churn_drivers",
         "row_prediction_explanation",
         "row_explanation_summary",
         "prediction_class_explanation",
@@ -2656,6 +3325,7 @@ def build_interventions(at_risk, factors, cluster_labels, cluster_descriptions):
 
     interventions = []
     intervention_counts = Counter()
+    cluster_intervention_counts = Counter()
     for row_rank, (_, row) in enumerate(result.iterrows()):
         factor_prefix, factor_description, factor_score = primary_factor_from_row(row, factor_metadata)
         probability = risk_probability(row)
@@ -2669,11 +3339,13 @@ def build_interventions(at_risk, factors, cluster_labels, cluster_descriptions):
 
         explanation_context = row_prediction_explanation_context(row)
         class_explanation_context = prediction_class_explanation_context(row)
+        model_driver_context = feature_weight_context(row)
         context = " ".join(
             part
             for part in (
                 factor_description,
                 row.get("cluster_description", ""),
+                model_driver_context,
                 explanation_context,
                 class_explanation_context,
             )
@@ -2685,8 +3357,10 @@ def build_interventions(at_risk, factors, cluster_labels, cluster_descriptions):
             row_context,
             context,
             intervention_counts,
+            cluster_intervention_counts,
         )
         intervention_counts[intervention["name"]] += 1
+        cluster_intervention_counts[(str(row.get("cluster_label", "")), intervention["name"])] += 1
         interventions.append(
             {
                 "primary_factor": factor_prefix,
@@ -2752,6 +3426,9 @@ if "show_intervention_editor" not in st.session_state:
 
 if "manual_explanations_by_job" not in st.session_state:
     st.session_state.manual_explanations_by_job = {}
+
+if "churn_feature_entries_by_label" not in st.session_state:
+    st.session_state.churn_feature_entries_by_label = {}
 
 if "manual_explanation_selection_versions" not in st.session_state:
     st.session_state.manual_explanation_selection_versions = {}
@@ -2941,8 +3618,8 @@ with st.sidebar:
     st.caption("1. Upload training and active-customer CSVs.")
     st.caption("2. Train or reuse the churn model.")
     st.caption("3. Score active customers and isolate predicted churners.")
-    st.caption("4. Run factor analysis and clustering.")
-    st.caption("5. Generate intervention actions.")
+    st.caption("4. Review model risk drivers and at-risk patterns.")
+    st.caption("5. Segment customers and generate intervention actions.")
 
 if not training_data or not test_data:
     st.info("Upload both CSV files in the sidebar to run the full demo.")
@@ -2985,6 +3662,7 @@ if training_data:
         )
 
 at_risk = None
+scored_customers = None
 prediction_explanations = pd.DataFrame()
 
 if test_data:
@@ -3002,7 +3680,12 @@ if test_data:
             active_customers = read_uploaded_csv(test_data)
             scored_customers, inference_payload, inference_job_id = run_prediction_inference(model_id, test_data)
             scored_customers = add_original_customer_features(scored_customers, active_customers)
-            scored_customers = add_prediction_descriptions(scored_customers, inference_payload)
+            scored_customers = add_prediction_descriptions(
+                scored_customers,
+                inference_payload,
+                inference_job_id,
+                model_id,
+            )
             at_risk = scored_customers
             at_risk = filter_at_risk_customers(scored_customers, churn_confidence_threshold)
 
@@ -3175,13 +3858,50 @@ else:
 
 if at_risk is not None:
     if at_risk.empty:
-        st.info("No at-risk customers found, so factor analysis was skipped.")
+        st.info("No at-risk customers found, so risk-driver analysis was skipped.")
     else:
-        st.subheader("3. Risk Drivers")
-        st.markdown('<div class="section-note">Factor analysis summarizes why customers are at risk.</div>', unsafe_allow_html=True)
+        st.subheader("3. Model Risk Drivers")
+        st.markdown('<div class="section-note">Feature weights and row explanations identify what pushed customers toward churn. Pattern analysis below is used as segment context.</div>', unsafe_allow_html=True)
+        feature_entries_by_label = st.session_state.get("churn_feature_entries_by_label", {})
+        driver_chart_data = risk_driver_chart_data_from_feature_entries(
+            feature_entries_by_label,
+            at_risk,
+        )
+        driver_source = "model feature weights"
+        if driver_chart_data.empty:
+            driver_chart_data = risk_driver_chart_data(at_risk)
+        if driver_chart_data.empty and scored_customers is not None:
+            driver_chart_data = risk_driver_chart_data_from_feature_contrast(at_risk, scored_customers)
+            driver_source = "feature contrast"
+        if driver_chart_data.empty:
+            st.info("No feature-weight risk drivers were returned for this prediction run.")
+        else:
+            if driver_source == "feature contrast":
+                st.caption(
+                    "Model feature weights were not returned by the API for this run, "
+                    "so the chart uses feature contrast between at-risk and retained customers."
+                )
+            driver_totals = (
+                driver_chart_data
+                .groupby("driver", as_index=False)
+                .agg(weighted_signal=("weighted_signal", "sum"), customers=("customers", "sum"))
+                .sort_values("weighted_signal", ascending=False)
+            )
+            driver_col, feature_col = st.columns([1, 1])
+            with driver_col:
+                st.bar_chart(driver_totals, x="driver", y="weighted_signal")
+            with feature_col:
+                st.dataframe(
+                    driver_chart_data.head(10),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        st.subheader("4. At-Risk Patterns")
+        st.markdown('<div class="section-note">Factor analysis summarizes variance within at-risk customers. Use these patterns for segmentation context, not as the source of truth for row-level churn causes.</div>', unsafe_allow_html=True)
         risk_modeling_data, risk_input_columns = analysis_dataframe_for_modeling(at_risk)
         if risk_modeling_data.empty or not risk_input_columns:
-            st.error("No usable customer feature columns were available for factor analysis.")
+            st.error("No usable customer feature columns were available for pattern analysis.")
             st.stop()
 
         cluster_modeling_data, cluster_input_columns = clustering_dataframe_for_modeling(risk_modeling_data)
@@ -3190,7 +3910,7 @@ if at_risk is not None:
             st.stop()
 
         st.caption(
-            f"Using {len(risk_input_columns)} customer feature columns for factor analysis "
+            f"Using {len(risk_input_columns)} customer feature columns for at-risk pattern analysis "
             f"and {len(cluster_input_columns)} numeric columns for clustering."
         )
         risk_csv = dataframe_to_csv_bytes(risk_modeling_data)
@@ -3216,13 +3936,13 @@ if at_risk is not None:
             cluster_dataset_name,
         )
 
-        with st.spinner("training factor analysis model", show_time=True):
+        with st.spinner("training at-risk pattern model", show_time=True):
             factor_model_id = get_or_start_model_training(
                 st.session_state.risk_ids,
                 risk_dataset_name,
                 f"factors:{risk_dataset_name}",
-                "factor analysis",
-                "Factor analysis model is ready.",
+                "at-risk pattern analysis",
+                "At-risk pattern model is ready.",
                 lambda: train_model(
                     risk_dataset_name.replace("risk_customers", "factor_analysis", 1),
                     "factors",
@@ -3231,7 +3951,7 @@ if at_risk is not None:
                 ),
             )
 
-        with st.spinner("factoring...", show_time=True):
+        with st.spinner("finding at-risk patterns...", show_time=True):
             factor_cache_key = inference_cache_key(
                 "factor_inference",
                 factor_model_id,
@@ -3244,7 +3964,7 @@ if at_risk is not None:
                 "risk_customers.csv",
                 "csv",
                 factor_cache_key,
-                "factor inference",
+                "pattern inference",
             )
 
         if show_raw_model_outputs:
@@ -3283,16 +4003,16 @@ if at_risk is not None:
                 labels=pie_chart_data["label"],
                 autopct="%1.1f%%",
             )
-            ax.set_title("Captured variance by churn-risk factor")
+            ax.set_title("Captured variance by at-risk pattern")
             ax.axis("equal")
             with chart_col:
                 st.pyplot(fig)
             with detail_col:
                 st.dataframe(chart_data, use_container_width=True, hide_index=True)
         else:
-            st.info("No factor variance columns were available for the pie chart.")
+            st.info("No pattern variance columns were available for the pie chart.")
 
-        st.subheader("4. Customer Segments")
+        st.subheader("5. Customer Segments")
         st.markdown('<div class="section-note">Clustering groups at-risk customers so intervention actions can account for segment context.</div>', unsafe_allow_html=True)
         with st.spinner("training clustering model", show_time=True):
             cluster_model_id = get_or_start_model_training(
@@ -3337,8 +4057,8 @@ if at_risk is not None:
             cluster_descriptions,
         )
 
-        st.subheader("5. Intervention Plan")
-        st.markdown('<div class="section-note">Each predicted churner gets an action based on factor scores, segment context, and relative risk.</div>', unsafe_allow_html=True)
+        st.subheader("6. Intervention Plan")
+        st.markdown('<div class="section-note">Each predicted churner gets an action based on model risk drivers, segment context, relative risk, and diversity within the plan and each cluster.</div>', unsafe_allow_html=True)
 
         high_count = (intervention_results["intervention_urgency"] == "high").sum()
         medium_count = (intervention_results["intervention_urgency"] == "medium").sum()
@@ -3357,6 +4077,9 @@ if at_risk is not None:
                 "intervention_urgency",
                 "intervention_category",
                 "intervention_action",
+                "model_risk_drivers",
+                "top_churn_drivers",
+                "top_protective_drivers",
                 "row_prediction_explanation",
                 "row_explanation_summary",
                 "prediction_class_explanation",
