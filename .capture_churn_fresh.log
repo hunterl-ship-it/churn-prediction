@@ -1,0 +1,20 @@
+/Users/hunterliao/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+
+=== Capturing churn demo artifacts ===
+  API: https://dev.woodwide.ai
+  Training on 50,000 sampled rows (of 168,682)
+  Uploading dataset historical_customers_train_466072ee99f3...
+  Training model churn_prediction_train_466072ee99f3...
+Stopped waiting locally while model training is still pending.
+{'job_id': '019ecc8c-b94d-73fb-8f5c-daec7ad177ea', 'type': 'train', 'status': 'running', 'created_at': '2026-06-15T18:30:34.907001Z', 'started_at': '2026-06-15T18:30:54.539525Z', 'created_by': {'principal_type': 'api_key', 'api_key_id': '019e6f12-f699-7584-bb8b-fedc9736c39a'}, 'model_type': 'prediction', 'model_id': '019ecc8c-b8c3-74d8-b880-643b88672159', 'dataset_id': '019ecc8c-040f-7102-9fb8-7aec4d4920fa', 'input': {'params': {}, 'model_id': '019ecc8c-b8c3-74d8-b880-643b88672159', 'dataset_id': '019ecc8c-040f-7102-9fb8-7aec4d4920fa', 'model_type': 'prediction', 'label_column': 'Churn', 'problem_type': 'prediction', 'input_columns': ['AccountAge', 'AverageViewingDuration', 'ContentDownloadsPerMonth', 'ContentType', 'DeviceRegistered', 'Gender', 'GenrePreference', 'MonthlyCharges', 'MultiDeviceAccess', 'PaperlessBilling', 'ParentalControl', 'PaymentMethod', 'SubscriptionType', 'SubtitlesEnabled', 'SupportTicketsPerMonth', 'TotalCharges', 'UserRating', 'ViewingHoursPerWeek', 'WatchlistSize'], 'dataset_version_id': '019ecc8c-044d-7744-81a3-a80fcd47d4eb', 'model_version_number': 1, 'dataset_version_number': 1}, 'output': {'progress': 30.0, 'estimated_seconds_remaining': 136642286.8}, 'resources': {'type': 'train', 'model': {'id': '019ecc8c-b8c3-74d8-b880-643b88672159', 'version_id': '019ecc8c-b8cd-76ed-9aa7-7c9a5bfcd126', 'version_number': 1}, 'dataset': {'id': '019ecc8c-040f-7102-9fb8-7aec4d4920fa', 'version_id': '019ecc8c-044d-7744-81a3-a80fcd47d4eb', 'version_number': 1, 'archived': False}}, 'woodwide_runtime_version': '0.1', 'progress': 30.0, 'estimated_seconds_remaining': 136642286.8}
+Traceback (most recent call last):
+  File "/Users/hunterliao/Documents/churn-prediction/scripts/capture_demo_artifacts.py", line 332, in <module>
+    
+  File "/Users/hunterliao/Documents/churn-prediction/scripts/capture_demo_artifacts.py", line 319, in main
+    parser.add_argument(
+  File "/Users/hunterliao/Documents/churn-prediction/scripts/capture_demo_artifacts.py", line 169, in capture_demo
+    if reuse_model_id:
+  File "/Users/hunterliao/Documents/churn-prediction/scripts/capture_demo_artifacts.py", line 108, in train_prediction_model
+    input_columns=input_columns,
+RuntimeError: Model training did not complete successfully (status=None)

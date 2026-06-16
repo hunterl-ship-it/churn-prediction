@@ -1,0 +1,18 @@
+{
+  "auc_roc": 0.6700026447043582,
+  "pr_auc": 0.2894194788590069,
+  "precision": 0.0,
+  "recall": 0.0,
+  "lift_top_decile": 1.6248711782892478,
+  "capture_top_decile": 0.16248711782892478,
+  "threshold": 0.5,
+  "top_fraction": 0.1,
+  "positive_rate": 0.19406666666666667,
+  "eval_rows": 15000,
+  "confusion": {
+    "tp": 0,
+    "fp": 0,
+    "tn": 12089,
+    "fn": 2911
+  }
+}

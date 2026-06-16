@@ -1,0 +1,22 @@
+{
+  "source": "woodwide_api",
+  "captured_at": "2026-06-15T19:59:50.881628+00:00",
+  "page_id": "churn",
+  "model_id": "019eccba-8b95-79ac-8783-67fdab113604",
+  "eval_job_id": "019eccdc-4202-7991-b5ff-16b172608e38",
+  "test_job_id": "019eccdc-e165-7675-aa24-bfb0f5a7a5bc",
+  "label_column": "Churn",
+  "threshold": 0.5,
+  "train_path": "datasets/churn/train.csv",
+  "test_path": "datasets/churn/test.csv",
+  "eval_path": "datasets/churn/eval.csv",
+  "api_base_url": "https://dev.woodwide.ai",
+  "scores_flipped": true,
+  "metrics_summary": {
+    "auc_roc": 0.6806531187511232,
+    "lift_top_decile": 1.6495601173020527,
+    "eval_rows": 15000
+  },
+  "at_risk_rows": 15852,
+  "explained_rows": 0
+}

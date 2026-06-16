@@ -1,0 +1,22 @@
+{
+  "source": "woodwide_api",
+  "captured_at": "2026-06-15T20:03:21.095866+00:00",
+  "page_id": "noshow",
+  "model_id": "019ecc2b-d952-7917-b6cc-4872471c6e63",
+  "eval_job_id": "019eccde-8688-78ad-9159-56c587adfb9a",
+  "test_job_id": "019eccdf-1e3f-7cb8-aacf-57d22bfab137",
+  "label_column": "no_show",
+  "threshold": 0.5,
+  "train_path": "datasets/healthcare/train.csv",
+  "test_path": "datasets/healthcare/test.csv",
+  "eval_path": "datasets/healthcare/eval.csv",
+  "api_base_url": "https://dev.woodwide.ai",
+  "scores_flipped": true,
+  "metrics_summary": {
+    "auc_roc": 0.6700026447043582,
+    "lift_top_decile": 1.6248711782892478,
+    "eval_rows": 15000
+  },
+  "at_risk_rows": 8893,
+  "explained_rows": 0
+}

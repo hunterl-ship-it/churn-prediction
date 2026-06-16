@@ -1,0 +1,11 @@
+driver,feature,weighted_signal,customers
+Other,LeadTimeDays,2404.4183511122937,8893
+Other,WaitTimeDays,2002.9251589318712,8893
+Other,Gender,701.8228401364673,8893
+Other,InsuranceType,669.3065414985064,8893
+Other,AppointmentType,646.6128335203298,8893
+Other,Age,517.2730616369267,8893
+Other,DistanceToClinicMiles,495.5415389688713,8893
+Other,ChronicConditionCount,494.46520301990006,8893
+Other,PreviousNoShows,482.26449419548425,8893
+Other,PreviousAppointments,478.3699769793484,8893

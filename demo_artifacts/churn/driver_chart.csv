@@ -1,0 +1,11 @@
+driver,feature,weighted_signal,customers
+Other,AccountAge,8014.047392411556,15852
+Commercial/renewal,TotalCharges,1772.998921688988,15852
+Commercial/renewal,MonthlyCharges,1338.1166643637969,15852
+Content engagement,ViewingHoursPerWeek,1185.2481643153826,15852
+Content engagement,ContentType,720.8641751072132,15852
+Commercial/renewal,SubscriptionType,617.6030235193383,15852
+Other,Gender,612.4707238545701,15852
+Billing,PaperlessBilling,538.1133997571803,15852
+Other,ParentalControl,526.9659320522085,15852
+Other,SubtitlesEnabled,525.5716029297636,15852
