@@ -498,7 +498,9 @@ def set_intervention_catalog_template(template_key):
     )
 
 
-def current_intervention_catalog():
+def current_intervention_catalog(template_key=None):
+    if template_key:
+        return default_intervention_catalog(template_key)
     return st.session_state.get("intervention_catalog") or default_intervention_catalog()
 
 
@@ -539,16 +541,16 @@ def dataframe_to_intervention_catalog(dataframe):
     return catalog
 
 
-def find_intervention_by_name(name):
-    for intervention in current_intervention_catalog():
+def find_intervention_by_name(name, template_key=None):
+    for intervention in current_intervention_catalog(template_key):
         if intervention["name"] == name:
             return intervention
     return None
 
 
-def find_first_intervention_by_names(names):
+def find_first_intervention_by_names(names, template_key=None):
     for name in names:
-        intervention = find_intervention_by_name(name)
+        intervention = find_intervention_by_name(name, template_key)
         if intervention:
             return intervention
     return None
@@ -3305,7 +3307,7 @@ def primary_factor_intervention_names(primary_factor_description):
     return []
 
 
-def intervention_match_candidates(row, context_text):
+def intervention_match_candidates(row, context_text, intervention_catalog=None):
     primary_factor_description = str(row.get("primary_factor_description", "")).lower()
     primary_names = set(primary_factor_intervention_names(primary_factor_description))
     row_explanation_text = row_prediction_explanation_context(row)
@@ -3313,7 +3315,7 @@ def intervention_match_candidates(row, context_text):
     feature_weight_text = feature_weight_context(row)
     candidates = []
 
-    for intervention in current_intervention_catalog():
+    for intervention in intervention_catalog or current_intervention_catalog():
         semantic_score = cosine_similarity(context_text, intervention["description"])
         row_explanation_score = cosine_similarity(row_explanation_text, intervention["description"])
         class_explanation_score = cosine_similarity(class_explanation_text, intervention["description"])
@@ -3352,8 +3354,14 @@ def intervention_match_candidates(row, context_text):
     return sorted(candidates, key=lambda candidate: candidate["score"], reverse=True)
 
 
-def choose_intervention(row, context_text, intervention_counts=None, cluster_intervention_counts=None):
-    candidates = intervention_match_candidates(row, context_text)
+def choose_intervention(
+    row,
+    context_text,
+    intervention_counts=None,
+    cluster_intervention_counts=None,
+    intervention_catalog=None,
+):
+    candidates = intervention_match_candidates(row, context_text, intervention_catalog)
     if not candidates:
         raise ValueError("No interventions are configured.")
 
@@ -3387,6 +3395,7 @@ def choose_intervention(row, context_text, intervention_counts=None, cluster_int
 
 def risk_probability(row):
     probability_columns = [
+        "risk_probability",
         "prediction_prob",
         "prediction_probability",
         "probability",
@@ -3433,8 +3442,6 @@ def urgency_from_probability(probability):
 def urgency_from_relative_risk(probability, high_cutoff, medium_cutoff):
     if probability is None:
         return None
-    if probability >= 0.9:
-        return "high"
     if probability >= high_cutoff:
         return "high"
     if probability >= medium_cutoff:
@@ -3914,24 +3921,32 @@ def build_interventions(at_risk, factors, cluster_labels, cluster_descriptions):
     sort_column = probability_sort_column(result)
     high_cutoff = None
     medium_cutoff = None
+    use_relative_thresholds = False
     if sort_column:
         sort_values = pd.to_numeric(result[sort_column], errors="coerce")
         if sort_values.notna().any():
             normalized_sort_values = sort_values.where(sort_values <= 1, sort_values / 100)
             high_cutoff = normalized_sort_values.quantile(0.8)
             medium_cutoff = normalized_sort_values.quantile(0.3)
+            use_relative_thresholds = (
+                normalized_sort_values.nunique(dropna=True) > 2
+                and high_cutoff is not None
+                and medium_cutoff is not None
+                and high_cutoff > medium_cutoff
+            )
             result = result.assign(_risk_sort=sort_values).sort_values("_risk_sort", ascending=False)
 
     interventions = []
     intervention_counts = Counter()
     cluster_intervention_counts = Counter()
+    intervention_catalog = current_intervention_catalog(segment_template)
     for row_rank, (_, row) in enumerate(result.iterrows()):
         factor_prefix, factor_description, factor_score = primary_factor_from_row(row, factor_metadata)
         probability = risk_probability(row)
-        if high_cutoff is not None and medium_cutoff is not None:
+        if use_relative_thresholds:
             urgency = urgency_from_relative_risk(probability, high_cutoff, medium_cutoff)
         else:
-            urgency = urgency_from_probability(probability)
+            urgency = None
 
         if urgency is None:
             urgency = fallback_urgency_from_rank(row_rank, len(result))
@@ -3957,6 +3972,7 @@ def build_interventions(at_risk, factors, cluster_labels, cluster_descriptions):
             context,
             intervention_counts,
             cluster_intervention_counts,
+            intervention_catalog,
         )
         intervention_counts[intervention["name"]] += 1
         cluster_intervention_counts[(str(row.get("cluster_label", "")), intervention["name"])] += 1
