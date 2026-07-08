@@ -893,6 +893,20 @@ def dataset_id_from_dataset(dataset):
     return dataset.get("id") or dataset.get("dataset_id")
 
 
+def model_id_from_training_payload(payload):
+    if not isinstance(payload, dict):
+        return None
+
+    for key in ("model", "data", "result", "job"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            model_id = value.get("id") or value.get("model_id")
+            if model_id:
+                return model_id
+
+    return payload.get("model_id") or payload.get("id")
+
+
 def datasets_from_response_payload(payload):
     if isinstance(payload, list):
         return payload
@@ -1249,7 +1263,11 @@ def train_model(model_name, model_type, dataset_id, label_column=None, input_col
         response.raise_for_status()
 
     payload = response.json()
-    return payload["model"]["id"], payload.get("job_id")
+    model_id = model_id_from_training_payload(payload)
+    if not model_id:
+        st.write(payload)
+        raise ValueError("Model training response did not include a model id.")
+    return model_id, payload.get("job_id")
 
 
 def get_or_start_model_training(
@@ -2040,6 +2058,20 @@ def driver_group_for_feature(feature):
         return "Billing"
     if any(token in normalized_feature for token in ("view", "watch", "genre", "content", "download", "device")):
         return "Content engagement"
+    if any(token in normalized_feature for token in ("lead", "wait", "schedule", "appointment", "appt", "dayof", "weekday", "hour")):
+        return "Scheduling"
+    if any(token in normalized_feature for token in ("noshow", "no_show", "previous", "history", "prior", "past")):
+        return "Appointment history"
+    if any(token in normalized_feature for token in ("chronic", "condition", "health", "diagnosis", "specialty", "procedure")):
+        return "Health status"
+    if any(token in normalized_feature for token in ("sms", "reminder", "call", "outreach", "notification")):
+        return "Outreach"
+    if any(token in normalized_feature for token in ("transport", "distance", "travel", "access", "barrier")):
+        return "Access"
+    if any(token in normalized_feature for token in ("age", "gender", "sex", "race", "ethnicity", "language")):
+        return "Demographics"
+    if any(token in normalized_feature for token in ("insurance", "coverage", "payer", "copay", "deductible")):
+        return "Coverage"
     return "Other"
 
 
@@ -3806,5 +3838,4 @@ def build_interventions(at_risk, factors, cluster_labels, cluster_descriptions):
         pd.concat([result.reset_index(drop=True), pd.DataFrame(interventions)], axis=1)
         .drop(columns=["_risk_sort", "_original_row_index"], errors="ignore")
     )
-
 

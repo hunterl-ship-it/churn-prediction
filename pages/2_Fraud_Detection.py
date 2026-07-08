@@ -2,8 +2,10 @@
 
 import pandas as pd
 import streamlit as st
+import matplotlib.pyplot as plt
 
 from actions.fraud_review import build_fraud_review_plan
+from shared.dashboard import init_dashboard_state, render_widget_controls, render_dashboard_header
 from shared.ui import (
     apply_page_style,
     configure_demo_app,
@@ -14,14 +16,11 @@ from shared.ui import (
     render_brand_header,
     render_demo_run_button,
     resolve_csv_sources,
+    section_note,
     workflow_not_ready_message,
 )
 
-from workflows.fraud import (
-    FRAUD_LABEL_COLUMN,
-    prepare_fraud_anomaly_datasets,
-    prepare_fraud_prediction_datasets,
-)
+from workflows.fraud import FRAUD_LABEL_COLUMN
 from woodwide.core import (
     DEFAULT_FRAUD_ANOMALY_TRAIN_DATASET_PATH,
     DEFAULT_FRAUD_PREDICTION_TRAIN_DATASET_PATH,
@@ -48,9 +47,20 @@ from woodwide.core import (
     train_model,
 )
 
+PAGE_ID = "fraud"
+
+ALL_FRAUD_WIDGETS = {
+    "raw_output": "Raw Scored Transactions",
+    "review_metrics": "Review Plan Metrics",
+    "review_plan": "Fraud Review Plan Table",
+    "severity_pie": "Review Severity Pie Chart",
+    "category_pie": "Review Category Pie Chart",
+}
+
 configure_demo_app("Fraud Detection")
 init_shared_session()
 apply_page_style()
+init_dashboard_state(PAGE_ID, list(ALL_FRAUD_WIDGETS.keys()))
 
 render_brand_header(
     title="Fraud Detection",
@@ -72,22 +82,6 @@ with st.sidebar:
         help="Prediction optimizes for fraud specifically. Anomaly flags unusual transactions vs a normal baseline.",
     )
 
-    st.divider()
-    st.header("Inputs")
-    if fraud_mode == "prediction":
-        train_label = f"Fraud-labeled history (must include `{FRAUD_LABEL_COLUMN}`)"
-    else:
-        train_label = "Normal transactions only (no fraud labels)"
-    uploaded_train = st.file_uploader(
-        train_label,
-        type=["csv"],
-        help="Upload your own training CSV, or use the demo datasets button below.",
-    )
-    uploaded_test = st.file_uploader(
-        "Transactions to score",
-        type=["csv"],
-        help="Upload your own scoring CSV, or use the demo datasets button below.",
-    )
     default_train_path = (
         DEFAULT_FRAUD_PREDICTION_TRAIN_DATASET_PATH
         if fraud_mode == "prediction"
@@ -103,8 +97,6 @@ with st.sidebar:
     )
     train_file, test_file = resolve_csv_sources(
         f"fraud_use_demo:{fraud_mode}",
-        uploaded_train,
-        uploaded_test,
         default_train_path,
         DEFAULT_FRAUD_SCORING_DATASET_PATH,
     )
@@ -128,15 +120,8 @@ with st.sidebar:
             "fraud_test.csv",
         )
 
-    raw_file = st.file_uploader(
-        "Or upload raw ecommerce CSV",
-        type=["csv"],
-        help="Optional: full dataset with is_fraud for one-click prep.",
-    )
-
     st.divider()
     st.header("Demo Settings")
-    preview_row_count = st.slider("Preview rows", 100, 5000, PREVIEW_ROW_COUNT, 100)
     score_label = "Fraud probability" if fraud_mode == "prediction" else "Anomaly score"
     fraud_threshold = st.slider(
         f"{score_label} threshold",
@@ -149,33 +134,8 @@ with st.sidebar:
     max_row_explanations = st.slider("Row explanations", 0, 50, 10, 5) if fraud_mode == "prediction" else 0
     show_raw_model_outputs = st.toggle("Show raw model outputs", value=False)
 
-    if raw_file:
-        if st.button("Prepare datasets from raw CSV", use_container_width=True):
-            raw_df = read_uploaded_csv(raw_file)
-            try:
-                if fraud_mode == "prediction":
-                    prepared_train, prepared_test = prepare_fraud_prediction_datasets(raw_df)
-                else:
-                    prepared_train, prepared_test = prepare_fraud_anomaly_datasets(raw_df)
-            except ValueError as error:
-                st.error(str(error))
-            else:
-                st.session_state["prepared_fraud_train"] = prepared_train
-                st.session_state["prepared_fraud_test"] = prepared_test
-                st.session_state["prepared_fraud_mode"] = fraud_mode
-                st.success("Prepared training and scoring files from raw upload.")
-
-prepared_train = st.session_state.get("prepared_fraud_train")
-prepared_test = st.session_state.get("prepared_fraud_test")
-prepared_mode = st.session_state.get("prepared_fraud_mode")
-
-if prepared_train is not None and prepared_mode != fraud_mode:
-    st.warning("Prepared datasets were built for a different mode. Re-run prep or upload mode-specific files.")
-    prepared_train = None
-    prepared_test = None
-
-training_source = train_file if train_file is not None else prepared_train
-scoring_source = test_file if test_file is not None else prepared_test
+training_source = train_file
+scoring_source = test_file
 
 if not training_source and not scoring_source:
     workflow_not_ready_message()
@@ -267,11 +227,13 @@ if training_source is not None:
             ),
         )
 
+# ── Compute scored + review plan ───────────────────────────────────────────────
 review_plan = None
+scored = None
 
 if scoring_source is not None:
     if model_id is None:
-        st.warning("Upload training data and wait for the model to finish training.")
+        st.warning("Select training data and wait for the model to finish training.")
     else:
         st.subheader("2. Flagged Transactions")
         section_note(
@@ -326,17 +288,30 @@ if scoring_source is not None:
 
             review_plan = build_fraud_review_plan(flagged)
 
-        if show_raw_model_outputs:
-            st.dataframe(scored, use_container_width=True, height=360)
-
+# ── Dashboard widget rendering ─────────────────────────────────────────────────
 if review_plan is not None:
-    score_column = probability_sort_column(review_plan) if fraud_mode == "prediction" else anomaly_score_column(review_plan)
-    st.subheader("3. Fraud Review Plan")
-    metric_a, metric_b, metric_c = st.columns(3)
-    metric_a.metric("Flagged transactions", f"{len(review_plan):,}")
-    metric_b.metric("High severity", f"{(review_plan['review_severity'] == 'high').sum():,}")
-    metric_c.metric("Threshold", f"{fraud_threshold:.0%}")
+    score_column = (
+        probability_sort_column(review_plan)
+        if fraud_mode == "prediction"
+        else anomaly_score_column(review_plan)
+    )
 
+    # Build pie data
+    severity_pie_data = {}
+    if "review_severity" in review_plan.columns:
+        severity_pie_data = {
+            str(k).title(): int(v)
+            for k, v in review_plan.groupby("review_severity").size().to_dict().items()
+        }
+
+    category_pie_data = {}
+    if "review_category" in review_plan.columns:
+        category_pie_data = {
+            str(k)[:28]: int(v)
+            for k, v in review_plan.groupby("review_category").size().to_dict().items()
+        }
+
+    # Build preferred column list once
     preferred = [
         score_column,
         "prediction",
@@ -352,18 +327,101 @@ if review_plan is not None:
         "address_mismatch",
         "high_risk_ip",
     ]
-    visible = [column for column in preferred if column and column in review_plan.columns]
-    if not visible:
-        visible = review_plan.columns.tolist()
+    visible = [c for c in preferred if c and c in review_plan.columns] or review_plan.columns.tolist()
 
-    plan_tab, download_tab = st.tabs(["Preview", "Download"])
-    with plan_tab:
-        st.dataframe(review_plan[visible].head(preview_row_count), use_container_width=True, height=520)
-    with download_tab:
-        st.download_button(
-            "Download fraud review plan CSV",
-            review_plan.to_csv(index=False).encode("utf-8"),
-            "fraud_review_plan.csv",
-            "text/csv",
-            use_container_width=True,
+    data_dict = {
+        "metrics": {
+            "Flagged transactions": f"{len(review_plan):,}",
+            "High severity": f"{(review_plan['review_severity'] == 'high').sum():,}" if "review_severity" in review_plan.columns else "N/A",
+            "Threshold": f"{fraud_threshold:.0%}",
+            "Mode": "Prediction" if fraud_mode == "prediction" else "Anomaly",
+        },
+        "severity_pie_data": severity_pie_data,
+        "category_pie_data": category_pie_data,
+        "review_plan_df": review_plan,
+        "raw_output_df": scored if scored is not None else pd.DataFrame(),
+    }
+
+    render_dashboard_header(PAGE_ID, ALL_FRAUD_WIDGETS, data_dict=data_dict)
+
+    active_widgets = st.session_state[f"{PAGE_ID}_active_widgets"]
+
+    def _pie(data: dict, title: str):
+        if not data:
+            st.info("No data available.")
+            return
+        fig, ax = plt.subplots(figsize=(6, 4))
+        colors = ["#0B3D2E", "#175cd3", "#f04438", "#f79009", "#668575", "#d8e2dc"]
+        ax.pie(
+            list(data.values()),
+            labels=list(data.keys()),
+            autopct="%1.1f%%",
+            colors=colors[: len(data)],
+            startangle=140,
         )
+        ax.axis("equal")
+        ax.set_title(title, fontsize=12, weight="bold", color="#0B3D2E")
+        fig.patch.set_facecolor("#ffffff")
+        st.pyplot(fig)
+        plt.close()
+
+    for idx, widget_id in enumerate(active_widgets):
+        if widget_id not in ALL_FRAUD_WIDGETS:
+            continue
+        widget_name = ALL_FRAUD_WIDGETS[widget_id]
+        collapsed = render_widget_controls(PAGE_ID, idx, widget_id, widget_name)
+        if collapsed:
+            continue
+
+        if widget_id == "raw_output":
+            if not show_raw_model_outputs:
+                st.info("Enable **Show raw model outputs** in the sidebar to display this widget.")
+            elif scored is not None:
+                row_sel, _ = st.columns([1, 3])
+                with row_sel:
+                    n = st.selectbox(
+                        "Rows to display",
+                        [10, 25, 50, 100, 250, 500, 1000],
+                        index=3,
+                        key=f"{PAGE_ID}_{widget_id}_rows",
+                    )
+                st.dataframe(scored.head(n), use_container_width=True, height=360)
+            else:
+                st.info("No raw output available yet.")
+
+        elif widget_id == "review_metrics":
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Flagged transactions", f"{len(review_plan):,}")
+            if "review_severity" in review_plan.columns:
+                m2.metric("High severity", f"{(review_plan['review_severity'] == 'high').sum():,}")
+            m3.metric("Threshold", f"{fraud_threshold:.0%}")
+
+        elif widget_id == "review_plan":
+            row_sel, _ = st.columns([1, 3])
+            with row_sel:
+                n = st.selectbox(
+                    "Rows to display",
+                    [10, 25, 50, 100, 250, 500, 1000],
+                    index=3,
+                    key=f"{PAGE_ID}_{widget_id}_rows",
+                )
+            plan_tab, dl_tab = st.tabs(["Preview", "Download"])
+            with plan_tab:
+                st.dataframe(review_plan[visible].head(n), use_container_width=True, height=520)
+            with dl_tab:
+                st.download_button(
+                    "Download fraud review plan CSV",
+                    review_plan.to_csv(index=False).encode("utf-8"),
+                    "fraud_review_plan.csv",
+                    "text/csv",
+                    use_container_width=True,
+                    key=f"{PAGE_ID}_{widget_id}_dl",
+                )
+
+        elif widget_id == "severity_pie":
+            _pie(severity_pie_data, "Review Severity Distribution")
+
+        elif widget_id == "category_pie":
+            _pie(category_pie_data, "Review Category Distribution")
+
+        st.divider()

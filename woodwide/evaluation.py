@@ -159,41 +159,41 @@ def render_performance_panel(
     animate: bool = False,
     skip_animation: bool = False,
 ):
-    st.subheader(title)
-    st.markdown(
-        '<div class="section-note">Holdout evaluation on a labeled sample from the demo dataset.</div>',
-        unsafe_allow_html=True,
-    )
+    with st.expander(title, expanded=True):
+        st.markdown(
+            '<div class="section-note">Holdout evaluation on a labeled sample from the demo dataset.</div>',
+            unsafe_allow_html=True,
+        )
 
-    col1, col2, col3, col4, col5 = st.columns(5)
-    columns = [col1, col2, col3, col4, col5]
-    specs = [
-        ("AUC-ROC", float(metrics.get("auc_roc", 0)), lambda value: f"{value:.3f}"),
-        ("PR-AUC", float(metrics.get("pr_auc", 0)), lambda value: f"{value:.3f}"),
-        ("Precision @ threshold", float(metrics.get("precision", 0)), lambda value: f"{value:.1%}"),
-        ("Lift @ top 10%", float(metrics.get("lift_top_decile", 0)), lambda value: f"{value:.1f}x"),
-        ("Capture @ top 10%", float(metrics.get("capture_top_decile", 0)), lambda value: f"{value:.1%}"),
-    ]
+        col1, col2, col3, col4, col5 = st.columns(5)
+        columns = [col1, col2, col3, col4, col5]
+        specs = [
+            ("AUC-ROC", float(metrics.get("auc_roc", 0)), lambda value: f"{value:.3f}"),
+            ("PR-AUC", float(metrics.get("pr_auc", 0)), lambda value: f"{value:.3f}"),
+            ("Precision @ threshold", float(metrics.get("precision", 0)), lambda value: f"{value:.1%}"),
+            ("Lift @ top 10%", float(metrics.get("lift_top_decile", 0)), lambda value: f"{value:.1f}x"),
+            ("Capture @ top 10%", float(metrics.get("capture_top_decile", 0)), lambda value: f"{value:.1%}"),
+        ]
 
-    if animate and not skip_animation:
-        from shared.instant_playback import animate_metrics_row
+        if animate and not skip_animation:
+            from shared.instant_playback import animate_metrics_row
 
-        animate_metrics_row(columns, specs, duration=1.0, skip=False)
-    else:
-        for column, (label, target, formatter) in zip(columns, specs):
-            column.metric(label, formatter(target))
+            animate_metrics_row(columns, specs, duration=1.0, skip=False)
+        else:
+            for column, (label, target, formatter) in zip(columns, specs):
+                column.metric(label, formatter(target))
 
-    confusion = metrics.get("confusion") or {}
-    if confusion:
-        detail_col1, detail_col2 = st.columns(2)
-        with detail_col1:
-            st.caption(
-                f"Threshold {metrics.get('threshold', 0.5):.0%} · "
-                f"Recall {metrics.get('recall', 0):.1%} · "
-                f"{metrics.get('eval_rows', 0):,} eval rows"
-            )
-        with detail_col2:
-            st.caption(
-                f"TP {confusion.get('tp', 0):,} · FP {confusion.get('fp', 0):,} · "
-                f"FN {confusion.get('fn', 0):,} · TN {confusion.get('tn', 0):,}"
-            )
+        confusion = metrics.get("confusion") or {}
+        if confusion:
+            detail_col1, detail_col2 = st.columns(2)
+            with detail_col1:
+                st.caption(
+                    f"Threshold {metrics.get('threshold', 0.5):.0%} · "
+                    f"Recall {metrics.get('recall', 0):.1%} · "
+                    f"{metrics.get('eval_rows', 0):,} eval rows"
+                )
+            with detail_col2:
+                st.caption(
+                    f"TP {confusion.get('tp', 0):,} · FP {confusion.get('fp', 0):,} · "
+                    f"FN {confusion.get('fn', 0):,} · TN {confusion.get('tn', 0):,}"
+                )

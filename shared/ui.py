@@ -519,30 +519,57 @@ def render_demo_run_button(session_key: str, *demo_paths: str, label: str = "Run
         st.rerun()
 
 
+def render_custom_csv_uploads(page_id: str, entity_name_plural: str):
+    """Render CSV upload controls for rerunning a hero workflow with user data."""
+    with st.expander("Run with your own CSVs", expanded=False):
+        st.caption(
+            "Upload a labeled training CSV and a scoring CSV with matching feature columns. "
+            "An optional labeled eval CSV enables holdout performance metrics for your data."
+        )
+        training_data = st.file_uploader(
+            "Training CSV",
+            type=["csv"],
+            key=f"{page_id}_custom_train_csv",
+            help="Include the outcome label column so Wood Wide can train a prediction model.",
+        )
+        scoring_data = st.file_uploader(
+            f"Scoring CSV ({entity_name_plural})",
+            type=["csv"],
+            key=f"{page_id}_custom_test_csv",
+            help="Rows to score with the trained model.",
+        )
+        eval_data = st.file_uploader(
+            "Optional eval CSV",
+            type=["csv"],
+            key=f"{page_id}_custom_eval_csv",
+            help="Optional labeled holdout with the same schema as the training CSV.",
+        )
+
+    has_custom_uploads = any(source is not None for source in (training_data, scoring_data, eval_data))
+    if has_custom_uploads:
+        if training_data and scoring_data:
+            st.success("Custom CSVs loaded. The workflow will rerun in Live API mode.")
+        else:
+            st.warning("Upload both a training CSV and a scoring CSV to rerun the workflow.")
+
+    return training_data, scoring_data, eval_data, has_custom_uploads
+
+
 def resolve_csv_sources(
     session_key: str,
-    train_uploaded,
-    test_uploaded,
     train_demo_path: str | None,
     test_demo_path: str | None,
 ):
     use_demo = st.session_state.get(session_key, False)
 
-    train_source = train_uploaded
-    if train_source is None and use_demo:
-        train_source = demo_csv(train_demo_path)
-
-    test_source = test_uploaded
-    if test_source is None and use_demo:
-        test_source = demo_csv(test_demo_path)
+    train_source = demo_csv(train_demo_path) if use_demo else None
+    test_source = demo_csv(test_demo_path) if use_demo else None
 
     return train_source, test_source
 
 
-def resolve_single_csv_source(session_key: str, uploaded, demo_path: str | None):
+def resolve_single_csv_source(session_key: str, demo_path: str | None):
     use_demo = st.session_state.get(session_key, False)
-    if uploaded is not None:
-        return uploaded
     if use_demo:
         return demo_csv(demo_path)
     return None
@@ -561,7 +588,7 @@ def is_demo_csv(source) -> bool:
 
 
 def workflow_not_ready_message():
-    st.info("Upload your CSVs or click **Run with demo datasets** in the sidebar to start the analysis.")
+    st.info("Click **Run with demo datasets** in the sidebar to start the analysis.")
 
 
 def apply_page_style():
@@ -621,7 +648,7 @@ def render_pilot_cta(headline_metric: str | None = None):
     st.markdown(
         f"""
         <div class="pilot-cta">
-            {metric_line}Want this workflow on your data?
+            Want this workflow on your data?
             <a href="{PILOT_CTA_URL}" target="_blank">Book a pilot conversation →</a>
         </div>
         """,

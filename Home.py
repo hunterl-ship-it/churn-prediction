@@ -117,7 +117,7 @@ with st.expander("How Wood Wide fits your workflow"):
             </p>
             <h4>What these demos show</h4>
             <ul>
-                <li>Upload or connect tabular data and train a reusable dataset representation once.</li>
+                <li>Connect tabular data and train a reusable dataset representation once.</li>
                 <li>Score holdout or production records asynchronously at scale.</li>
                 <li>Explain individual predictions so operators can act with confidence.</li>
                 <li>Turn model output into prioritized business actions—not just scores.</li>

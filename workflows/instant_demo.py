@@ -56,6 +56,13 @@ def load_metadata(page_id: str) -> dict | None:
         return json.load(file)
 
 
+def load_patterns(page_id: str) -> pd.DataFrame:
+    path = artifacts_dir(page_id) / "patterns.csv"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_csv(path)
+
+
 def load_explanations(page_id: str) -> pd.DataFrame:
     path = artifacts_dir(page_id) / "explanations.json"
     if not path.exists():

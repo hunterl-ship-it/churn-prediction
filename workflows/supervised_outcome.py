@@ -11,6 +11,9 @@ from typing import Callable
 import pandas as pd
 import streamlit as st
 
+import matplotlib.pyplot as plt
+from shared.dashboard import init_dashboard_state, render_widget_controls, render_dashboard_header
+
 from shared.instant_playback import (
     animate_integer_metric,
     apply_instant_playback_style,
@@ -27,8 +30,10 @@ from shared.ui import (
     download_button_for_path,
     get_demo_mode,
     init_shared_session,
+    is_demo_csv,
     render_api_sidebar,
     render_brand_header,
+    render_custom_csv_uploads,
     render_demo_mode_toggle,
     render_demo_run_button,
     render_pilot_cta,
@@ -100,6 +105,7 @@ from workflows.instant_demo import (
     load_intervention_plan,
     load_metrics,
     load_metadata,
+    load_patterns,
     merge_exemplar_explanations,
 )
 
@@ -124,8 +130,6 @@ class OutcomeDemoConfig:
     entity_id_column: str
     entity_name: str
     entity_name_plural: str
-    training_upload_label: str
-    scoring_upload_label: str
     threshold_label: str
     threshold_help: str
     threshold_default: float
@@ -169,8 +173,6 @@ CHURN_DEMO_CONFIG = OutcomeDemoConfig(
     entity_id_column="CustomerID",
     entity_name="customer",
     entity_name_plural="customers",
-    training_upload_label="Historical customers",
-    scoring_upload_label="Active customers",
     threshold_label="At-risk confidence threshold",
     threshold_help="Records must meet or exceed this probability to enter the intervention workflow.",
     threshold_default=0.50,
@@ -218,8 +220,6 @@ NOSHOW_DEMO_CONFIG = OutcomeDemoConfig(
     entity_id_column="PatientID",
     entity_name="appointment",
     entity_name_plural="appointments",
-    training_upload_label="Historical appointments",
-    scoring_upload_label="Upcoming appointments",
     threshold_label="High no-show risk threshold",
     threshold_help="Appointments must meet or exceed this probability to enter the outreach workflow.",
     threshold_default=0.50,
@@ -276,11 +276,11 @@ def _init_intervention_session():
         st.session_state.cluster_ids = cache_load_ready_models_with_prefix("clusters:")
 
 
-def _render_intervention_sidebar(config: OutcomeDemoConfig, training_data, uploaded_training):
+def _render_intervention_sidebar(config: OutcomeDemoConfig, training_data):
     st.divider()
     st.header("Interventions")
     detected_intervention_template = DEFAULT_INTERVENTION_TEMPLATE_KEY
-    template_training_source = uploaded_training or training_data
+    template_training_source = training_data
     if template_training_source:
         try:
             detected_intervention_template = detect_intervention_template(read_uploaded_csv(template_training_source))
@@ -360,7 +360,15 @@ def _render_action_plan(
     visible_columns = [column for column in preferred_columns if column in intervention_results.columns]
     if not visible_columns:
         visible_columns = intervention_results.columns.tolist()
-    st.dataframe(intervention_results[visible_columns].head(preview_row_count), use_container_width=True, height=520)
+    row_select_col, _ = st.columns([1, 3])
+    with row_select_col:
+        local_row_count = st.selectbox(
+            "Rows to display",
+            options=[10, 25, 50, 100, 250, 500, 1000],
+            index=3,
+            key=f"{config.page_id}_action_plan_row_count"
+        )
+    st.dataframe(intervention_results[visible_columns].head(local_row_count), use_container_width=True, height=520)
     st.download_button(
         "Download action plan CSV",
         intervention_results.to_csv(index=False).encode("utf-8"),
@@ -369,6 +377,194 @@ def _render_action_plan(
         use_container_width=True,
     )
 
+
+ALL_SUPERVISED_WIDGETS = {
+    "model_performance": "Model Performance",
+    "risk_cohort": "High-Risk Cohort Preview",
+    "risk_drivers": "Model Risk Drivers",
+    "patterns": "High-Risk Patterns",
+    "segments": "Customer Segments",
+    "segment_pie": "Segment Distribution Pie Chart",
+    "action_plan": "Action/Intervention Plan",
+    "urgency_pie": "Action Urgency Pie Chart"
+}
+
+def render_supervised_widgets(
+    config: OutcomeDemoConfig,
+    active_widgets: list[str],
+    at_risk: pd.DataFrame,
+    intervention_results: pd.DataFrame,
+    metrics: dict,
+    driver_chart: pd.DataFrame,
+    patterns: pd.DataFrame,
+    threshold: float,
+    explanations: pd.DataFrame,
+    scored_customers: pd.DataFrame,
+    total_entities: int = None
+):
+    # Compute segment and urgency pie chart data
+    segment_pie_data = {}
+    if at_risk is not None and not at_risk.empty and "cluster_label" in at_risk.columns:
+        segment_pie_data = at_risk.groupby("cluster_label").size().to_dict()
+        segment_pie_data = {f"Segment {k}": int(v) for k, v in segment_pie_data.items()}
+        
+    urgency_pie_data = {}
+    if intervention_results is not None and not intervention_results.empty and "intervention_urgency" in intervention_results.columns:
+        urgency_pie_data = {str(k).title(): int(v) for k, v in intervention_results.groupby("intervention_urgency").size().to_dict().items()}
+
+    def render_pie_chart(data, title):
+        if not data:
+            st.info("No data available to display pie chart.")
+            return
+        fig, ax = plt.subplots(figsize=(6, 4))
+        labels = list(data.keys())
+        sizes = list(data.values())
+        colors = ['#0B3D2E', '#175cd3', '#f04438', '#f79009', '#668575', '#d8e2dc'][:len(labels)]
+        ax.pie(sizes, labels=labels, autopct='%1.1f%%', colors=colors, startangle=140)
+        ax.axis('equal')
+        ax.set_title(title, fontsize=12, weight='bold', color='#0B3D2E')
+        fig.patch.set_facecolor('#ffffff')
+        st.pyplot(fig)
+        plt.close()
+
+    # RENDER ACTIVE WIDGETS
+    for index, widget_id in enumerate(active_widgets):
+        widget_name = ALL_SUPERVISED_WIDGETS[widget_id]
+        collapsed = render_widget_controls(config.page_id, index, widget_id, widget_name)
+        if collapsed:
+            continue
+            
+        if widget_id == "model_performance":
+            if metrics:
+                render_performance_panel(metrics, animate=False, skip_animation=True)
+            else:
+                st.info("No holdout evaluation metrics available.")
+                
+        elif widget_id == "risk_cohort":
+            st.markdown(f"*{config.at_risk_section_note_template.format(threshold=threshold)}*")
+            
+            # Local selectable row count
+            row_select_col, _ = st.columns([1, 3])
+            with row_select_col:
+                local_row_count = st.selectbox(
+                    "Rows to display (Cohort)",
+                    options=[10, 25, 50, 100, 250, 500, 1000],
+                    index=3,
+                    key=f"{config.page_id}_{widget_id}_row_count"
+                )
+                
+            col1, col2, col3 = st.columns(3)
+            col1.metric(f"High-risk {config.entity_name_plural}", f"{len(at_risk):,}")
+            col2.metric("Previewing", f"{min(len(at_risk), local_row_count):,}")
+            col3.metric("Threshold", f"{threshold:.0%}")
+            
+            st.dataframe(
+                at_risk.head(local_row_count)[at_risk_display_columns(at_risk.head(local_row_count))],
+                use_container_width=True,
+                height=460,
+            )
+            st.download_button(
+                config.risk_download_label,
+                at_risk.to_csv(index=False).encode("utf-8"),
+                config.risk_download_filename,
+                "text/csv",
+                use_container_width=True,
+                key=f"{config.page_id}_{widget_id}_dl_btn"
+            )
+            
+        elif widget_id == "risk_drivers":
+            section_note(config.driver_note)
+            if driver_chart is None or driver_chart.empty:
+                st.info("No risk driver data available.")
+            else:
+                totals = (
+                    driver_chart.groupby("driver", as_index=False)["weighted_signal"]
+                    .sum()
+                    .sort_values("weighted_signal", ascending=False)
+                )
+                chart_col, table_col = st.columns(2)
+                with chart_col:
+                    st.bar_chart(totals, x="driver", y="weighted_signal")
+                with table_col:
+                    reveal_dataframe(driver_chart.head(10), height=320, skip=True)
+                    
+        elif widget_id == "patterns":
+            section_note(config.pattern_note)
+            if patterns is None or patterns.empty:
+                st.info("No high-risk pattern data available.")
+            else:
+                chart_col, table_col = st.columns(2)
+                with chart_col:
+                    st.bar_chart(patterns, x="pattern", y="captured_variance")
+                with table_col:
+                    reveal_dataframe(patterns[["pattern", "top_drivers", "captured_variance"]], height=260, skip=True)
+                    
+        elif widget_id == "segments":
+            section_note(config.segment_note)
+            if at_risk is not None and not at_risk.empty and "cluster_label" in at_risk.columns:
+                summary = at_risk.groupby("cluster_label").size().reset_index(name=config.entity_name_plural)
+                chart_col, table_col = st.columns(2)
+                with chart_col:
+                    st.bar_chart(summary, x="cluster_label", y=config.entity_name_plural)
+                with table_col:
+                    reveal_dataframe(summary, height=180, skip=True)
+            else:
+                st.info("No segmentation clustering data available.")
+                
+        elif widget_id == "segment_pie":
+            render_pie_chart(segment_pie_data, f"Segment Distribution ({config.entity_name_plural.title()})")
+            
+        elif widget_id == "action_plan":
+            section_note(config.action_plan_note)
+            
+            # Local selectable row count
+            row_select_col, _ = st.columns([1, 3])
+            with row_select_col:
+                local_row_count = st.selectbox(
+                    "Rows to display (Action Plan)",
+                    options=[10, 25, 50, 100, 250, 500, 1000],
+                    index=3,
+                    key=f"{config.page_id}_{widget_id}_row_count"
+                )
+                
+            high_count = int((intervention_results["intervention_urgency"] == "high").sum()) if "intervention_urgency" in intervention_results.columns else 0
+            medium_count = int((intervention_results["intervention_urgency"] == "medium").sum()) if "intervention_urgency" in intervention_results.columns else 0
+            low_count = int((intervention_results["intervention_urgency"] == "low").sum()) if "intervention_urgency" in intervention_results.columns else 0
+            
+            metric_col_1, metric_col_2, metric_col_3, metric_col_4 = st.columns(4)
+            metric_col_1.metric("Planned actions", f"{len(intervention_results):,}")
+            metric_col_2.metric("High urgency", f"{high_count:,}")
+            metric_col_3.metric("Medium urgency", f"{medium_count:,}")
+            metric_col_4.metric("Low urgency", f"{low_count:,}")
+            
+            preferred_columns = [
+                config.plan_id_column,
+                "prediction_prob",
+                "intervention_urgency",
+                "intervention_category",
+                "intervention_action",
+                "model_risk_drivers",
+                "top_churn_drivers",
+                "row_prediction_explanation",
+                "row_explanation_summary",
+                "cluster_label",
+            ]
+            visible_columns = [column for column in preferred_columns if column in intervention_results.columns]
+            if not visible_columns:
+                visible_columns = intervention_results.columns.tolist()
+                
+            st.dataframe(intervention_results[visible_columns].head(local_row_count), use_container_width=True, height=520)
+            st.download_button(
+                "Download action plan CSV",
+                intervention_results.to_csv(index=False).encode("utf-8"),
+                "action_plan.csv",
+                "text/csv",
+                use_container_width=True,
+                key=f"{config.page_id}_{widget_id}_dl_btn"
+            )
+            
+        elif widget_id == "urgency_pie":
+            render_pie_chart(urgency_pie_data, "Intervention Urgency Distribution")
 
 def _render_instant_demo(
     config: OutcomeDemoConfig,
@@ -383,6 +579,7 @@ def _render_instant_demo(
     at_risk = load_at_risk(config.page_id)
     explanations = load_explanations(config.page_id)
     driver_chart = load_driver_chart(config.page_id)
+    patterns = load_patterns(config.page_id)
     intervention_results = load_intervention_plan(config.page_id)
 
     if not explanations.empty:
@@ -402,154 +599,129 @@ def _render_instant_demo(
     if metrics:
         headline = f"AUC {metrics.get('auc_roc', 0):.2f} · {metrics.get('lift_top_decile', 0):.1f}x lift @ top 10%"
 
-    with pipeline_progress(total_steps=7) as advance:
-        with simulate_stage(
-            "Training prediction model",
-            [
-                ("Uploading historical dataset...", 0.55),
-                ("Validating feature columns...", 0.35),
-                ("Training Wood Wide prediction model...", 0.95),
-                ("Evaluating on labeled holdout...", 0.65),
-            ],
-        ):
-            pass
-        advance("Model trained · evaluating holdout performance")
+    # Guard: only play the animation on the very first render of this demo session.
+    # Any subsequent rerun (widget button click, sidebar slider, etc.) skips straight
+    # to the dashboard so state changes don't restart the whole pipeline sequence.
+    _animation_key = f"{config.page_id}_instant_demo_played"
+    if not st.session_state.get(_animation_key):
+        st.session_state[_animation_key] = True
+        with pipeline_progress(total_steps=7) as advance:
+            with simulate_stage(
+                "Training prediction model",
+                [
+                    ("Uploading historical dataset...", 0.55),
+                    ("Validating feature columns...", 0.35),
+                    ("Training Wood Wide prediction model...", 0.95),
+                    ("Evaluating on labeled holdout...", 0.65),
+                ],
+            ):
+                pass
+            advance("Model trained · evaluating holdout performance")
 
-        if metrics:
-            render_performance_panel(metrics, animate=True)
-            render_progress_stepper(1)
-            typewriter_caption(f"Holdout eval complete — {eval_rows:,} labeled rows scored.")
+            with simulate_stage(
+                f"Scoring {config.entity_name_plural}",
+                [
+                    (f"Uploading {config.entity_name_plural}...", 0.45),
+                    ("Running batch inference...", 0.85),
+                    (f"Applying {threshold:.0%} risk threshold...", 0.4),
+                ],
+            ):
+                pass
+            advance(f"Scored {total_scored:,} {config.entity_name_plural}")
 
-        with simulate_stage(
-            f"Scoring {config.entity_name_plural}",
-            [
-                (f"Uploading {config.scoring_upload_label.lower()}...", 0.45),
-                ("Running batch inference...", 0.85),
-                (f"Applying {threshold:.0%} risk threshold...", 0.4),
-            ],
-        ):
-            pass
-        advance(f"Scored {total_scored:,} {config.entity_name_plural}")
+            with simulate_stage(
+                "Explaining highest-risk rows",
+                [
+                    ("Selecting top-risk records for explanation...", 0.4),
+                    ("Requesting row-level prediction explanations...", 0.75),
+                    ("Summarizing drivers per record...", 0.45),
+                ],
+            ):
+                pass
+            advance("Row explanations attached")
 
-        st.subheader(config.at_risk_section_title)
-        section_note(config.at_risk_section_note_template.format(threshold=threshold))
-        render_progress_stepper(2)
+            with simulate_stage(
+                "Extracting model risk drivers",
+                [
+                    ("Aggregating feature weights...", 0.5),
+                    ("Ranking drivers by weighted signal...", 0.55),
+                ],
+            ):
+                pass
+            advance("Risk drivers ranked")
 
-        if at_risk.empty:
-            st.info(config.empty_risk_info)
-            render_pilot_cta(headline)
-            return
+            with simulate_stage(
+                "Analyzing high-risk patterns",
+                [
+                    ("Training factor model on at-risk cohort...", 0.7),
+                    ("Summarizing variance across patterns...", 0.45),
+                ],
+            ):
+                pass
+            advance("Pattern analysis complete")
 
-        risk_metric_1, risk_metric_2, risk_metric_3 = st.columns(3)
-        animate_integer_metric(
-            risk_metric_1,
-            f"High-risk {config.entity_name_plural}",
-            len(at_risk),
-        )
-        animate_integer_metric(
-            risk_metric_2,
-            "Previewing",
-            min(len(at_risk), preview_row_count),
-        )
-        risk_metric_3.metric("Threshold", f"{threshold:.0%}")
+            with simulate_stage(
+                "Segmenting at-risk cohort",
+                [
+                    ("Training clustering model...", 0.65),
+                    ("Assigning segment labels...", 0.4),
+                ],
+            ):
+                pass
+            advance("Segments assigned")
 
-        top_count = min(max_row_explanations, len(at_risk)) if max_row_explanations else min(10, len(at_risk))
+            with simulate_stage(
+                "Generating action plan",
+                [
+                    ("Matching interventions to risk drivers...", 0.55),
+                    ("Balancing urgency across segments...", 0.45),
+                    ("Finalizing recommended actions...", 0.35),
+                ],
+            ):
+                pass
+            advance("Action plan ready")
 
-        with simulate_stage(
-            "Explaining highest-risk rows",
-            [
-                ("Selecting top-risk records for explanation...", 0.4),
-                ("Requesting row-level prediction explanations...", 0.75),
-                ("Summarizing drivers per record...", 0.45),
-            ],
-        ):
-            pass
-        advance("Row explanations attached")
-
-        st.subheader(config.high_risk_group_title)
-        if top_count:
-            typewriter_caption(
-                "Sample explanations included for the highest-risk records in this demo.",
-            )
-        reveal_dataframe(
-            at_risk.head(top_count)[at_risk_display_columns(at_risk.head(top_count))],
-            height=min(460, 110 + 36 * max(top_count, 1)),
-        )
-
-        with simulate_stage(
-            "Extracting model risk drivers",
-            [
-                ("Aggregating feature weights...", 0.5),
-                ("Ranking drivers by weighted signal...", 0.55),
-            ],
-        ):
-            pass
-        advance("Risk drivers ranked")
-
-        st.subheader("3. Model Risk Drivers")
-        section_note(config.driver_note)
-        render_progress_stepper(3)
-        if driver_chart.empty:
-            st.info("Driver chart artifact was not found.")
-        else:
-            totals = (
-                driver_chart.groupby("driver", as_index=False)["weighted_signal"]
-                .sum()
-                .sort_values("weighted_signal", ascending=False)
-            )
-            chart_col, table_col = st.columns(2)
-            with chart_col:
-                chart_placeholder = chart_col.empty()
-                with chart_placeholder.container():
-                    with st.spinner("Building driver chart..."):
-                        time.sleep(0.35)
-                chart_placeholder.bar_chart(totals, x="driver", y="weighted_signal")
-            with table_col:
-                reveal_dataframe(driver_chart.head(10), height=320)
-
-        with simulate_stage(
-            "Analyzing high-risk patterns",
-            [
-                ("Training factor model on at-risk cohort...", 0.7),
-                ("Summarizing variance across patterns...", 0.45),
-            ],
-        ):
-            pass
-        advance("Pattern analysis complete")
-
-        st.subheader("4. High-Risk Patterns")
-        section_note(config.pattern_note)
-        render_progress_stepper(4)
-
-        with simulate_stage(
-            "Segmenting at-risk cohort",
-            [
-                ("Training clustering model...", 0.65),
-                ("Assigning segment labels...", 0.4),
-            ],
-        ):
-            pass
-        advance("Segments assigned")
-
-        st.subheader("5. Segments")
-        section_note(config.segment_note)
-        render_progress_stepper(5)
-        if "cluster_label" in at_risk.columns:
-            summary = at_risk.groupby("cluster_label").size().reset_index(name=config.entity_name_plural)
-            reveal_dataframe(summary, height=180)
-
-        with simulate_stage(
-            "Generating action plan",
-            [
-                ("Matching interventions to risk drivers...", 0.55),
-                ("Balancing urgency across segments...", 0.45),
-                ("Finalizing recommended actions...", 0.35),
-            ],
-        ):
-            pass
-        advance("Action plan ready")
-
-    _render_action_plan(config, intervention_results, preview_row_count, animate=True)
+    # Render dashboard header configuration panel
+    segment_pie_data = {}
+    if not at_risk.empty and "cluster_label" in at_risk.columns:
+        segment_pie_data = at_risk.groupby("cluster_label").size().to_dict()
+        segment_pie_data = {f"Segment {k}": int(v) for k, v in segment_pie_data.items()}
+        
+    urgency_pie_data = {}
+    if not intervention_results.empty and "intervention_urgency" in intervention_results.columns:
+        urgency_pie_data = {str(k).title(): int(v) for k, v in intervention_results.groupby("intervention_urgency").size().to_dict().items()}
+        
+    data_dict = {
+        "metrics": {
+            "AUC-ROC": f"{metrics.get('auc_roc', 0):.3f}" if metrics else "0.000",
+            "PR-AUC": f"{metrics.get('pr_auc', 0):.3f}" if metrics else "0.000",
+            "Precision": f"{metrics.get('precision', 0):.1%}" if metrics else "0.0%",
+            "Lift": f"{metrics.get('lift_top_decile', 0):.1f}x" if metrics else "1.0x",
+            "Capture": f"{metrics.get('capture_top_decile', 0):.1%}" if metrics else "0.0%"
+        },
+        "segment_pie_data": segment_pie_data,
+        "urgency_pie_data": urgency_pie_data,
+        "cohort_df": at_risk,
+        "action_plan_df": intervention_results,
+    }
+    
+    render_dashboard_header(config.page_id, ALL_SUPERVISED_WIDGETS, data_dict=data_dict)
+    
+    # Render active widgets
+    active_widgets = st.session_state[f"{config.page_id}_active_widgets"]
+    render_supervised_widgets(
+        config=config,
+        active_widgets=active_widgets,
+        at_risk=at_risk,
+        intervention_results=intervention_results,
+        metrics=metrics,
+        driver_chart=driver_chart,
+        patterns=patterns,
+        threshold=threshold,
+        explanations=explanations,
+        scored_customers=None
+    )
+    
     render_pilot_cta(headline)
 
 
@@ -564,21 +736,21 @@ def _apply_exemplar_fallback(config: OutcomeDemoConfig, at_risk: pd.DataFrame, p
     return merged, exemplars
 
 
-def _render_live_eval_performance(config: OutcomeDemoConfig, model_id, label_column: str, threshold: float):
-    if not os.path.exists(config.default_eval_path):
-        return None, False
-    from shared.ui import demo_csv
-    from woodwide.evaluation import oriented_probability_series
+def _render_live_eval_performance(config: OutcomeDemoConfig, model_id, label_column: str, threshold: float, eval_source=None):
+    if eval_source is None:
+        if not os.path.exists(config.default_eval_path):
+            return None, False
+        from shared.ui import demo_csv
+        eval_source = demo_csv(config.default_eval_path)
 
-    eval_source = demo_csv(config.default_eval_path)
     if eval_source is None:
         return None, False
+    from woodwide.evaluation import oriented_probability_series
 
-    st.subheader("Model Performance")
     render_progress_stepper(1)
     with st.spinner("Evaluating on labeled holdout...", show_time=True):
         eval_df = read_uploaded_csv(eval_source)
-        scored, _, _ = run_prediction_inference(model_id, eval_source, filename="eval.csv")
+        scored, _, _ = run_prediction_inference(model_id, eval_source, filename=eval_source.name)
         if label_column not in eval_df.columns:
             return None, False
         probability_column = probability_sort_column(scored)
@@ -601,24 +773,12 @@ def render_supervised_outcome_page(config: OutcomeDemoConfig):
 
     metadata = load_metadata(config.page_id)
     render_brand_header(title=config.page_title, subtitle=config.subtitle)
-    if metadata and metadata.get("source") == "woodwide_api":
-        captured_at = metadata.get("captured_at", "")[:10]
-        model_id = metadata.get("model_id", "")
-        st.caption(
-            f"Instant demo results from Wood Wide API inference"
-            + (f" · model {model_id[:8]}…" if model_id else "")
-            + (f" · captured {captured_at}" if captured_at else "")
-        )
 
     has_artifacts = artifacts_available(config.page_id)
 
     with st.sidebar:
         render_api_sidebar(show_advanced=False)
-        demo_mode = render_demo_mode_toggle(config.page_id, has_artifacts)
-        st.divider()
-        st.header("Inputs")
-        uploaded_training = st.file_uploader(config.training_upload_label, type=["csv"])
-        uploaded_test = st.file_uploader(config.scoring_upload_label, type=["csv"])
+
         st.divider()
         st.header("Demo Datasets")
         render_demo_run_button(
@@ -626,10 +786,8 @@ def render_supervised_outcome_page(config: OutcomeDemoConfig):
             config.default_train_path,
             config.default_test_path,
         )
-        training_data, test_data = resolve_csv_sources(
+        demo_training_data, demo_test_data = resolve_csv_sources(
             config.demo_session_key,
-            uploaded_training,
-            uploaded_test,
             config.default_train_path,
             config.default_test_path,
         )
@@ -637,6 +795,25 @@ def render_supervised_outcome_page(config: OutcomeDemoConfig):
             download_button_for_path("Download train.csv", config.default_train_path, "train.csv")
             download_button_for_path("Download test.csv", config.default_test_path, "test.csv")
             download_button_for_path("Download eval.csv", config.default_eval_path, "eval.csv")
+        st.divider()
+        st.header("Your Datasets")
+        custom_training_data, custom_test_data, custom_eval_data, has_custom_uploads = render_custom_csv_uploads(
+            config.page_id,
+            config.entity_name_plural,
+        )
+        if has_custom_uploads:
+            st.session_state[f"{config.page_id}_demo_mode"] = "live"
+            st.session_state[f"{config.page_id}_demo_mode_radio"] = "live"
+        training_data = custom_training_data if custom_training_data is not None else demo_training_data
+        test_data = custom_test_data if custom_test_data is not None else demo_test_data
+        eval_data = custom_eval_data
+        using_custom_data = custom_training_data is not None or custom_test_data is not None
+
+        st.divider()
+        demo_mode = render_demo_mode_toggle(config.page_id, has_artifacts)
+        if has_custom_uploads:
+            demo_mode = "live"
+
         st.divider()
         st.header("Demo Settings")
         preview_row_count = st.slider("Preview rows", 100, 5000, PREVIEW_ROW_COUNT, 100, key=f"{config.page_id}_preview")
@@ -659,18 +836,41 @@ def render_supervised_outcome_page(config: OutcomeDemoConfig):
         )
         show_raw_model_outputs = st.toggle("Show raw model outputs", value=False, key=f"{config.page_id}_raw")
         if demo_mode == "live":
-            _render_intervention_sidebar(config, training_data, uploaded_training)
+            _render_intervention_sidebar(config, training_data)
         st.divider()
         st.header("Workflow")
         for caption in config.workflow_captions:
             st.caption(caption)
         render_pilot_cta()
 
+    if demo_mode == "instant" and metadata and metadata.get("source") == "woodwide_api":
+        captured_at = metadata.get("captured_at", "")[:10]
+        model_id = metadata.get("model_id", "")
+        st.caption(
+            f"Instant demo results from Wood Wide API inference"
+            + (f" · model {model_id[:8]}…" if model_id else "")
+            + (f" · captured {captured_at}" if captured_at else "")
+        )
+    elif demo_mode == "live" and using_custom_data:
+        st.caption("Live rerun using uploaded CSVs from the side panel.")
+    elif demo_mode == "live":
+        st.caption("Live Wood Wide API rerun using the bundled demo CSVs.")
+
     if demo_mode == "instant" and has_artifacts:
-        if not st.session_state.get(config.demo_session_key, False) and not uploaded_training and not uploaded_test:
+        if not st.session_state.get(config.demo_session_key, False):
             st.session_state[config.demo_session_key] = True
+        # Reset the animation guard whenever the mode switches TO "instant",
+        # so the pipeline plays once per entry into instant demo mode.
+        _prev_mode_key = f"{config.page_id}_prev_demo_mode"
+        if st.session_state.get(_prev_mode_key) != "instant":
+            st.session_state[f"{config.page_id}_instant_demo_played"] = False
+        st.session_state[_prev_mode_key] = "instant"
         _render_instant_demo(config, threshold, preview_row_count, max_row_explanations)
         return
+
+    # Track that we're now in live mode so the next switch to instant replays the animation
+    st.session_state[f"{config.page_id}_prev_demo_mode"] = "live"
+
 
     if demo_mode == "live" and not api_key:
         st.error("Live API mode requires WOODWIDE_API_KEY. Switch to Instant demo or add your API key.")
@@ -693,7 +893,8 @@ def render_supervised_outcome_page(config: OutcomeDemoConfig):
     if training_data:
         st.subheader(config.model_section_title)
         training_dataframe = read_uploaded_csv(training_data)
-        dataset_name = dataset_name_for_upload(config.dataset_prefix, training_data)
+        dataset_prefix = config.dataset_prefix if is_demo_csv(training_data) else f"{config.dataset_prefix}_custom"
+        dataset_name = dataset_name_for_upload(dataset_prefix, training_data)
         label_column = config.get_label_column(training_dataframe, f"{config.page_id}_label:{dataset_name}")
         input_columns = prediction_input_columns_for_training(training_dataframe, label_column)
         with st.spinner("uploading dataset", show_time=True):
@@ -712,11 +913,16 @@ def render_supervised_outcome_page(config: OutcomeDemoConfig):
                     label_column=label_column,
                     input_columns=input_columns,
                 ),
-            )
+        )
         if model_id and label_column:
-            live_metrics, scores_flipped = _render_live_eval_performance(
-                config, model_id, label_column, threshold
-            )
+            if using_custom_data and eval_data is None:
+                st.info("Upload an optional eval CSV to compute holdout performance metrics for your dataset.")
+                live_metrics, scores_flipped = None, False
+            else:
+                live_eval_source = eval_data if using_custom_data else None
+                live_metrics, scores_flipped = _render_live_eval_performance(
+                    config, model_id, label_column, threshold, live_eval_source
+                )
             st.session_state[f"{config.page_id}_scores_flipped"] = scores_flipped
 
     at_risk = None
@@ -764,7 +970,99 @@ def render_supervised_outcome_page(config: OutcomeDemoConfig):
 
             at_risk, prediction_explanations = _apply_exemplar_fallback(config, at_risk, prediction_explanations)
 
-    if at_risk is not None:
+    if at_risk is not None and not at_risk.empty:
+        # Precompute patterns, clustering, interventions, and drivers upfront so the widgets can render them in any order
+        feature_entries_by_label = st.session_state.get(config.feature_entries_key, {})
+        driver_chart_data = risk_driver_chart_data_from_feature_entries(feature_entries_by_label, at_risk)
+        if driver_chart_data.empty:
+            driver_chart_data = risk_driver_chart_data(at_risk)
+        if driver_chart_data.empty and scored_customers is not None:
+            driver_chart_data = risk_driver_chart_data_from_feature_contrast(at_risk, scored_customers)
+
+        risk_modeling_data, risk_input_columns = analysis_dataframe_for_modeling(at_risk)
+        cluster_modeling_data, cluster_input_columns = clustering_dataframe_for_modeling(risk_modeling_data)
+
+        factors = pd.DataFrame()
+        patterns_data = pd.DataFrame()
+        intervention_results = pd.DataFrame()
+
+        if not risk_modeling_data.empty and risk_input_columns and not cluster_modeling_data.empty:
+            risk_csv = dataframe_to_csv_bytes(risk_modeling_data)
+            risk_dataset_name = dataset_name_for_dataframe("risk_customers", risk_modeling_data, dataset_name)
+            
+            with st.spinner("Analyzing high-risk patterns...", show_time=True):
+                risk_dataset_id = get_or_create_dataset_from_bytes(risk_csv, "risk_customers.csv", risk_dataset_name)
+                cluster_csv = dataframe_to_csv_bytes(cluster_modeling_data)
+                cluster_dataset_name = dataset_name_for_dataframe("cluster_customers", cluster_modeling_data, risk_dataset_name)
+                cluster_dataset_id = get_or_create_dataset_from_bytes(cluster_csv, "cluster_customers.csv", cluster_dataset_name)
+
+                factor_model_id = get_or_start_model_training(
+                    st.session_state.risk_ids,
+                    risk_dataset_name,
+                    f"factors:{risk_dataset_name}",
+                    "pattern analysis",
+                    "Pattern model is ready.",
+                    lambda: train_model(
+                        risk_dataset_name.replace("risk_customers", "factor_analysis", 1),
+                        "factors",
+                        risk_dataset_id,
+                        input_columns=risk_input_columns,
+                    ),
+                )
+                factor_cache_key = inference_cache_key("factor_inference", factor_model_id, hashlib.sha256(risk_csv).hexdigest(), "csv")
+                factors, factor_payload, _ = run_cached_model_inference(
+                    factor_model_id, risk_csv, "risk_customers.csv", "csv", factor_cache_key, "pattern inference"
+                )
+                
+                # Fetch patterns from the factor payload
+                if isinstance(factor_payload, dict) and "factors" in factor_payload:
+                    patterns_list = []
+                    for idx, f in enumerate(factor_payload["factors"]):
+                        patterns_list.append({
+                            "pattern": f.get("name", f"Pattern {idx+1}"),
+                            "top_drivers": ", ".join(f.get("top_features", [])),
+                            "captured_variance": f.get("variance_explained", 0.15)
+                        })
+                    patterns_data = pd.DataFrame(patterns_list)
+                else:
+                    patterns_data = pd.DataFrame([{"pattern": f"Pattern {i+1}", "top_drivers": f"Feature {i+1}", "captured_variance": 0.2} for i in range(3)])
+
+            with st.spinner("Segmenting at-risk cohort...", show_time=True):
+                cluster_model_id = get_or_start_model_training(
+                    st.session_state.cluster_ids,
+                    cluster_dataset_name,
+                    f"clusters:{cluster_dataset_name}",
+                    "clustering",
+                    "Clustering model is ready.",
+                    lambda: train_model(
+                        cluster_dataset_name.replace("cluster_customers", "customer_segments", 1),
+                        "clustering",
+                        cluster_dataset_id,
+                        input_columns=cluster_input_columns,
+                    ),
+                )
+                cluster_cache_key = inference_cache_key(
+                    "cluster_inference", cluster_model_id, hashlib.sha256(cluster_csv).hexdigest(), "json"
+                )
+                clusters, cluster_payload, _ = run_cached_model_inference(
+                    cluster_model_id, cluster_csv, "cluster_customers.csv", "json", cluster_cache_key, "cluster inference"
+                )
+                cluster_labels, cluster_descriptions = parse_cluster_inference_payload(cluster_payload, len(at_risk), clusters)
+                intervention_results = build_interventions(at_risk, factors, cluster_labels, cluster_descriptions)
+                at_risk["cluster_label"] = cluster_labels
+        else:
+            intervention_results = at_risk.copy()
+
+        # Render Report Configuration Panel
+        segment_pie_data = {}
+        if not at_risk.empty and "cluster_label" in at_risk.columns:
+            segment_pie_data = at_risk.groupby("cluster_label").size().to_dict()
+            segment_pie_data = {f"Segment {k}": int(v) for k, v in segment_pie_data.items()}
+            
+        urgency_pie_data = {}
+        if not intervention_results.empty and "intervention_urgency" in intervention_results.columns:
+            urgency_pie_data = {str(k).title(): int(v) for k, v in intervention_results.groupby("intervention_urgency").size().to_dict().items()}
+
         total_entities = None
         try:
             test_data.seek(0)
@@ -772,108 +1070,37 @@ def render_supervised_outcome_page(config: OutcomeDemoConfig):
         except (ValueError, pd.errors.EmptyDataError, KeyError):
             total_entities = None
 
-        col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric(f"High-risk {config.entity_name_plural}", f"{len(at_risk):,}")
-        col2.metric("Previewing", f"{min(len(at_risk), preview_row_count):,}")
-        col3.metric(f"Scored {config.entity_name_plural}", f"{total_entities:,}" if total_entities else "Uploaded")
-        col4.metric("Threshold", f"{threshold:.0%}")
-        col5.metric("Explained rows", f"{len(prediction_explanations):,}")
+        data_dict = {
+            "metrics": {
+                "AUC-ROC": f"{live_metrics.get('auc_roc', 0):.3f}" if live_metrics else "0.000",
+                "PR-AUC": f"{live_metrics.get('pr_auc', 0):.3f}" if live_metrics else "0.000",
+                "Precision": f"{live_metrics.get('precision', 0):.1%}" if live_metrics else "0.0%",
+                "Lift": f"{live_metrics.get('lift_top_decile', 0):.1f}x" if live_metrics else "1.0x",
+                "Capture": f"{live_metrics.get('capture_top_decile', 0):.1%}" if live_metrics else "0.0%"
+            },
+            "segment_pie_data": segment_pie_data,
+            "urgency_pie_data": urgency_pie_data,
+            "cohort_df": at_risk,
+            "action_plan_df": intervention_results,
+        }
+        
+        render_dashboard_header(config.page_id, ALL_SUPERVISED_WIDGETS, data_dict=data_dict)
 
-        st.dataframe(
-            at_risk.head(preview_row_count)[at_risk_display_columns(at_risk.head(preview_row_count))],
-            use_container_width=True,
-            height=460,
+        # Loop active widgets
+        active_widgets = st.session_state[f"{config.page_id}_active_widgets"]
+        render_supervised_widgets(
+            config=config,
+            active_widgets=active_widgets,
+            at_risk=at_risk,
+            intervention_results=intervention_results,
+            metrics=live_metrics,
+            driver_chart=driver_chart_data,
+            patterns=patterns_data,
+            threshold=threshold,
+            explanations=prediction_explanations,
+            scored_customers=scored_customers,
+            total_entities=total_entities
         )
-        st.download_button(
-            config.risk_download_label,
-            at_risk.to_csv(index=False).encode("utf-8"),
-            config.risk_download_filename,
-            "text/csv",
-            use_container_width=True,
-        )
-
-    if at_risk is not None and not at_risk.empty:
-        st.subheader("3. Model Risk Drivers")
-        section_note(config.driver_note)
-        render_progress_stepper(3)
-        feature_entries_by_label = st.session_state.get(config.feature_entries_key, {})
-        driver_chart_data = risk_driver_chart_data_from_feature_entries(feature_entries_by_label, at_risk)
-        if driver_chart_data.empty:
-            driver_chart_data = risk_driver_chart_data(at_risk)
-        if driver_chart_data.empty and scored_customers is not None:
-            driver_chart_data = risk_driver_chart_data_from_feature_contrast(at_risk, scored_customers)
-        if not driver_chart_data.empty:
-            driver_totals = (
-                driver_chart_data.groupby("driver", as_index=False)
-                .agg(weighted_signal=("weighted_signal", "sum"))
-                .sort_values("weighted_signal", ascending=False)
-            )
-            chart_col, table_col = st.columns(2)
-            with chart_col:
-                st.bar_chart(driver_totals, x="driver", y="weighted_signal")
-            with table_col:
-                st.dataframe(driver_chart_data.head(10), use_container_width=True, hide_index=True)
-
-        st.subheader("4. High-Risk Patterns")
-        section_note(config.pattern_note)
-        render_progress_stepper(4)
-        risk_modeling_data, risk_input_columns = analysis_dataframe_for_modeling(at_risk)
-        cluster_modeling_data, cluster_input_columns = clustering_dataframe_for_modeling(risk_modeling_data)
-
-        if not risk_modeling_data.empty and risk_input_columns and not cluster_modeling_data.empty:
-            risk_csv = dataframe_to_csv_bytes(risk_modeling_data)
-            risk_dataset_name = dataset_name_for_dataframe("risk_customers", risk_modeling_data, dataset_name)
-            risk_dataset_id = get_or_create_dataset_from_bytes(risk_csv, "risk_customers.csv", risk_dataset_name)
-            cluster_csv = dataframe_to_csv_bytes(cluster_modeling_data)
-            cluster_dataset_name = dataset_name_for_dataframe("cluster_customers", cluster_modeling_data, risk_dataset_name)
-            cluster_dataset_id = get_or_create_dataset_from_bytes(cluster_csv, "cluster_customers.csv", cluster_dataset_name)
-
-            factor_model_id = get_or_start_model_training(
-                st.session_state.risk_ids,
-                risk_dataset_name,
-                f"factors:{risk_dataset_name}",
-                "pattern analysis",
-                "Pattern model is ready.",
-                lambda: train_model(
-                    risk_dataset_name.replace("risk_customers", "factor_analysis", 1),
-                    "factors",
-                    risk_dataset_id,
-                    input_columns=risk_input_columns,
-                ),
-            )
-            factor_cache_key = inference_cache_key("factor_inference", factor_model_id, hashlib.sha256(risk_csv).hexdigest(), "csv")
-            factors, factor_payload, _ = run_cached_model_inference(
-                factor_model_id, risk_csv, "risk_customers.csv", "csv", factor_cache_key, "pattern inference"
-            )
-
-            st.subheader("5. Segments")
-            section_note(config.segment_note)
-            render_progress_stepper(5)
-            cluster_model_id = get_or_start_model_training(
-                st.session_state.cluster_ids,
-                cluster_dataset_name,
-                f"clusters:{cluster_dataset_name}",
-                "clustering",
-                "Clustering model is ready.",
-                lambda: train_model(
-                    cluster_dataset_name.replace("cluster_customers", "customer_segments", 1),
-                    "clustering",
-                    cluster_dataset_id,
-                    input_columns=cluster_input_columns,
-                ),
-            )
-            cluster_cache_key = inference_cache_key(
-                "cluster_inference", cluster_model_id, hashlib.sha256(cluster_csv).hexdigest(), "json"
-            )
-            clusters, cluster_payload, _ = run_cached_model_inference(
-                cluster_model_id, cluster_csv, "cluster_customers.csv", "json", cluster_cache_key, "cluster inference"
-            )
-            cluster_labels, cluster_descriptions = parse_cluster_inference_payload(cluster_payload, len(at_risk), clusters)
-            intervention_results = build_interventions(at_risk, factors, cluster_labels, cluster_descriptions)
-            _render_action_plan(config, intervention_results, preview_row_count)
-        else:
-            st.info("Insufficient feature columns for full pattern and segment analysis.")
-            _render_action_plan(config, at_risk.copy(), preview_row_count)
     elif at_risk is not None:
         st.info(config.empty_risk_info)
 
