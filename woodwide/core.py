@@ -3655,6 +3655,140 @@ def parse_cluster_inference(response, expected_rows):
     return parse_cluster_inference_payload(response.json(), expected_rows)
 
 
+SYNTHETIC_SEGMENT_PROFILES = {
+    "streaming": [
+        (
+            "Premium Multi-Device Loyalists",
+            "Long-tenured, higher-value subscribers with broad device access and premium-plan behavior.",
+        ),
+        (
+            "Budget Plan Price Watchers",
+            "Cost-sensitive subscribers whose risk is tied to plan fit, charges, and lower perceived value.",
+        ),
+        (
+            "Low-Engagement Casual Viewers",
+            "Subscribers with lighter viewing activity, smaller watchlists, or weaker content engagement.",
+        ),
+        (
+            "Billing-Friction Accounts",
+            "Accounts where payment method, paperless billing, or charge patterns suggest operational friction.",
+        ),
+        (
+            "Family Feature Users",
+            "Households using subtitles, parental controls, or multiple devices where retention depends on feature fit.",
+        ),
+        (
+            "Support-Sensitive Streamers",
+            "Subscribers with support contacts or lower satisfaction signals that warrant service recovery.",
+        ),
+    ],
+    "healthcare": [
+        (
+            "Repeat No-Show Patients",
+            "Patients with prior missed visits or attendance patterns that need stronger confirmation workflows.",
+        ),
+        (
+            "Long-Lead Specialty Visits",
+            "Appointments booked farther out or in specialty care where schedule drift raises no-show risk.",
+        ),
+        (
+            "Access Barrier Patients",
+            "Patients with distance, transportation, insurance, or access constraints that may block attendance.",
+        ),
+        (
+            "Reminder-Sensitive Appointments",
+            "Visits where SMS, call, timing, or outreach signals suggest reminder escalation can help.",
+        ),
+        (
+            "New Patient Onboarding",
+            "First-time or low-history patients who may need preparation, directions, or intake support.",
+        ),
+        (
+            "Chronic Care Follow-Ups",
+            "Patients with clinical complexity where care-continuity messaging can reduce missed appointments.",
+        ),
+    ],
+    "generic": [
+        (
+            "High-Value Retention Accounts",
+            "Important records with elevated risk and enough value to justify high-touch intervention.",
+        ),
+        (
+            "Engagement Recovery Group",
+            "Records whose risk is driven by lower activity, adoption, or recent interaction depth.",
+        ),
+        (
+            "Operational Friction Group",
+            "Records with billing, scheduling, support, or process signals that suggest fixable friction.",
+        ),
+        (
+            "Price and Plan Fit Group",
+            "Records where cost, package fit, or commercial terms appear connected to risk.",
+        ),
+        (
+            "Low-Signal Monitoring Group",
+            "Records with moderate risk and fewer strong drivers, best handled with lightweight monitoring.",
+        ),
+        (
+            "Service Recovery Group",
+            "Records with satisfaction, support, or experience signals that call for direct recovery action.",
+        ),
+    ],
+}
+
+
+def segment_template_for_dataframe(dataframe):
+    if dataframe is None:
+        return "generic"
+    template = detect_intervention_template(dataframe)
+    if template == "healthcare":
+        return "healthcare"
+    if template == "streaming":
+        return "streaming"
+    return "generic"
+
+
+def segment_index_for_label(cluster_label):
+    if cluster_label is None or (isinstance(cluster_label, float) and math.isnan(cluster_label)):
+        return None
+
+    text = str(cluster_label).strip()
+    if not text:
+        return None
+
+    segment_match = re.search(r"\bsegment\s+(\d+)\b", text, flags=re.IGNORECASE)
+    if segment_match:
+        return max(0, int(segment_match.group(1)) - 1)
+
+    number = as_number(text)
+    if number is None:
+        return None
+    return int(number)
+
+
+def segment_profile_for_label(cluster_label, dataframe=None, template_key=None):
+    template = template_key or segment_template_for_dataframe(dataframe)
+    profiles = SYNTHETIC_SEGMENT_PROFILES.get(template) or SYNTHETIC_SEGMENT_PROFILES["generic"]
+    index = segment_index_for_label(cluster_label)
+    if index is None:
+        return str(cluster_label or "Unassigned Segment"), ""
+    name, description = profiles[index % len(profiles)]
+    return name, description
+
+
+def segment_name_for_label(cluster_label, dataframe=None, template_key=None):
+    text = str(cluster_label or "").strip()
+    if text and segment_index_for_label(text) is None:
+        return text
+    name, _ = segment_profile_for_label(cluster_label, dataframe, template_key)
+    return name
+
+
+def segment_description_for_label(cluster_label, dataframe=None, template_key=None):
+    _, description = segment_profile_for_label(cluster_label, dataframe, template_key)
+    return description
+
+
 def build_factor_metadata(factors):
     metadata = {}
     factor_prefixes = [
@@ -3754,6 +3888,7 @@ def build_interventions(at_risk, factors, cluster_labels, cluster_descriptions):
     result = at_risk.reset_index(drop=True).copy()
     result["_original_row_index"] = result.index
     factor_metadata = build_factor_metadata(factors)
+    segment_template = segment_template_for_dataframe(result)
 
     if len(factors) == len(result):
         factor_score_columns = [
@@ -3766,9 +3901,13 @@ def build_interventions(at_risk, factors, cluster_labels, cluster_descriptions):
             axis=1,
         )
 
-    result["cluster_label"] = cluster_labels
+    result["cluster_label"] = [
+        segment_name_for_label(label, result, segment_template)
+        for label in cluster_labels
+    ]
     result["cluster_description"] = [
         cluster_description_for_label(label, cluster_descriptions)
+        or segment_description_for_label(label, result, segment_template)
         for label in cluster_labels
     ]
 
@@ -3838,4 +3977,3 @@ def build_interventions(at_risk, factors, cluster_labels, cluster_descriptions):
         pd.concat([result.reset_index(drop=True), pd.DataFrame(interventions)], axis=1)
         .drop(columns=["_risk_sort", "_original_row_index"], errors="ignore")
     )
-

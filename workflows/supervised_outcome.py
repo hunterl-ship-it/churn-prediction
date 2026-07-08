@@ -91,6 +91,7 @@ from woodwide.core import (
     risk_driver_chart_data_from_feature_entries,
     run_cached_model_inference,
     run_prediction_inference,
+    segment_name_for_label,
     set_intervention_catalog_template,
     stored_manual_explanations,
     store_manual_explanations,
@@ -406,7 +407,7 @@ def render_supervised_widgets(
     segment_pie_data = {}
     if at_risk is not None and not at_risk.empty and "cluster_label" in at_risk.columns:
         segment_pie_data = at_risk.groupby("cluster_label").size().to_dict()
-        segment_pie_data = {f"Segment {k}": int(v) for k, v in segment_pie_data.items()}
+        segment_pie_data = {segment_name_for_label(k, at_risk): int(v) for k, v in segment_pie_data.items()}
         
     urgency_pie_data = {}
     if intervention_results is not None and not intervention_results.empty and "intervention_urgency" in intervention_results.columns:
@@ -503,6 +504,9 @@ def render_supervised_widgets(
             section_note(config.segment_note)
             if at_risk is not None and not at_risk.empty and "cluster_label" in at_risk.columns:
                 summary = at_risk.groupby("cluster_label").size().reset_index(name=config.entity_name_plural)
+                summary["cluster_label"] = summary["cluster_label"].map(
+                    lambda label: segment_name_for_label(label, at_risk)
+                )
                 chart_col, table_col = st.columns(2)
                 with chart_col:
                     st.bar_chart(summary, x="cluster_label", y=config.entity_name_plural)
@@ -685,7 +689,7 @@ def _render_instant_demo(
     segment_pie_data = {}
     if not at_risk.empty and "cluster_label" in at_risk.columns:
         segment_pie_data = at_risk.groupby("cluster_label").size().to_dict()
-        segment_pie_data = {f"Segment {k}": int(v) for k, v in segment_pie_data.items()}
+        segment_pie_data = {segment_name_for_label(k, at_risk): int(v) for k, v in segment_pie_data.items()}
         
     urgency_pie_data = {}
     if not intervention_results.empty and "intervention_urgency" in intervention_results.columns:
@@ -1049,7 +1053,10 @@ def render_supervised_outcome_page(config: OutcomeDemoConfig):
                 )
                 cluster_labels, cluster_descriptions = parse_cluster_inference_payload(cluster_payload, len(at_risk), clusters)
                 intervention_results = build_interventions(at_risk, factors, cluster_labels, cluster_descriptions)
-                at_risk["cluster_label"] = cluster_labels
+                at_risk["cluster_label"] = [
+                    segment_name_for_label(label, at_risk)
+                    for label in cluster_labels
+                ]
         else:
             intervention_results = at_risk.copy()
 
@@ -1057,7 +1064,7 @@ def render_supervised_outcome_page(config: OutcomeDemoConfig):
         segment_pie_data = {}
         if not at_risk.empty and "cluster_label" in at_risk.columns:
             segment_pie_data = at_risk.groupby("cluster_label").size().to_dict()
-            segment_pie_data = {f"Segment {k}": int(v) for k, v in segment_pie_data.items()}
+            segment_pie_data = {segment_name_for_label(k, at_risk): int(v) for k, v in segment_pie_data.items()}
             
         urgency_pie_data = {}
         if not intervention_results.empty and "intervention_urgency" in intervention_results.columns:

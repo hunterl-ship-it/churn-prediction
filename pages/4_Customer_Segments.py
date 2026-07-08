@@ -34,6 +34,8 @@ from woodwide.core import (
     parse_cluster_inference_payload,
     read_uploaded_csv,
     run_cached_model_inference,
+    segment_description_for_label,
+    segment_name_for_label,
     train_model,
 )
 
@@ -149,12 +151,19 @@ if customer_file:
         )
 
     segmented = scoring_df.copy()
-    segmented["cluster_label"] = labels
+    segmented["cluster_label"] = [
+        segment_name_for_label(label, segmented)
+        for label in labels
+    ]
     segmented["cluster_description"] = [
         descriptions.get(label) or descriptions.get(str(label), "")
         if isinstance(descriptions, dict)
         else ""
         for label in labels
+    ]
+    segmented["cluster_description"] = [
+        description or segment_description_for_label(label, segmented)
+        for description, label in zip(segmented["cluster_description"], labels)
     ]
 
 # ── Dashboard widget rendering ──────────────────────────────────────────────────
