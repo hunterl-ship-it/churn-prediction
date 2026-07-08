@@ -2722,6 +2722,25 @@ def warn_explanations_unavailable(response=None):
     )
 
 
+def explanation_job_id_from_response(response, inference_job_id):
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    explanation_job_id = (
+        payload.get("job_id") or payload.get("id")
+        if isinstance(payload, dict)
+        else None
+    )
+    if not explanation_job_id:
+        mark_explanations_unavailable(inference_job_id)
+        warn_explanations_unavailable(response)
+        return None
+
+    return explanation_job_id
+
+
 def request_row_level_explanation_batch(inference_job_id, row_ids, output_type="json"):
     if explanations_disabled_for_job(inference_job_id):
         return None
@@ -2752,7 +2771,10 @@ def request_row_level_explanation_batch(inference_job_id, row_ids, output_type="
         report_api_error("The Wood Wide API request failed.", response)
         response.raise_for_status()
 
-    explanation_job_id = response.json()["job_id"]
+    explanation_job_id = explanation_job_id_from_response(response, inference_job_id)
+    if not explanation_job_id:
+        return None
+
     cache_save_inference_job(cache_key, explanation_job_id, "pending")
     if not wait_for_job_succeeded(explanation_job_id, "row explanation"):
         cache_delete_inference_job(cache_key)
@@ -2848,7 +2870,10 @@ def start_row_level_explanation_job(inference_job_id, row_ids, output_type="json
         report_api_error("The Wood Wide API request failed.", response)
         response.raise_for_status()
 
-    explanation_job_id = response.json()["job_id"]
+    explanation_job_id = explanation_job_id_from_response(response, inference_job_id)
+    if not explanation_job_id:
+        return cache_key, "unavailable", pd.DataFrame()
+
     cache_save_inference_job(cache_key, explanation_job_id, "pending")
     return cache_key, "pending", pd.DataFrame()
 
@@ -3439,16 +3464,6 @@ def urgency_from_probability(probability):
     return "low"
 
 
-def urgency_from_relative_risk(probability, high_cutoff, medium_cutoff):
-    if probability is None:
-        return None
-    if probability >= high_cutoff:
-        return "high"
-    if probability >= medium_cutoff:
-        return "medium"
-    return "low"
-
-
 def probability_sort_column(dataframe):
     candidate_columns = [
         "risk_probability",
@@ -3471,13 +3486,118 @@ def probability_sort_column(dataframe):
     return None
 
 
-def fallback_urgency_from_rank(row_index, total_rows):
-    if total_rows <= 1:
-        return "medium"
-    percentile = row_index / (total_rows - 1)
-    if percentile < 0.2:
+def risk_distribution_stats(dataframe):
+    probabilities = probability_series(dataframe)
+    if probabilities is None or probabilities.dropna().empty:
+        return {}
+
+    probabilities = probabilities.dropna()
+    q25 = probabilities.quantile(0.25)
+    q75 = probabilities.quantile(0.75)
+    iqr = q75 - q25
+    return {
+        "median": probabilities.median(),
+        "iqr": iqr if iqr and iqr > 0 else probabilities.std(),
+        "min": probabilities.min(),
+        "max": probabilities.max(),
+    }
+
+
+def normalized_risk_strength(probability, risk_stats):
+    if probability is None or not risk_stats:
+        return 0.5
+
+    median = risk_stats.get("median")
+    spread = risk_stats.get("iqr") or 0
+    if median is None or spread <= 0:
+        min_value = risk_stats.get("min")
+        max_value = risk_stats.get("max")
+        if min_value is None or max_value is None or max_value <= min_value:
+            return 0.5
+        return max(0.0, min(1.0, (probability - min_value) / (max_value - min_value)))
+
+    z_score = max(-4.0, min(4.0, (probability - median) / spread))
+    return 1 / (1 + math.exp(-1.1 * z_score))
+
+
+def row_context_severity(row, template_key):
+    severity = 0.0
+
+    def numeric(column):
+        return as_number(row.get(column))
+
+    if template_key == "healthcare":
+        previous_no_shows = numeric("PreviousNoShows")
+        if previous_no_shows is not None:
+            severity += min(0.18, previous_no_shows * 0.045)
+        lead_time = numeric("LeadTimeDays")
+        if lead_time is not None and lead_time >= 30:
+            severity += 0.05
+        wait_time = numeric("WaitTimeDays")
+        if wait_time is not None and wait_time >= 21:
+            severity += 0.04
+        distance = numeric("DistanceToClinicMiles")
+        if distance is not None and distance >= 20:
+            severity += 0.05
+        if str(row.get("TransportationBarrier", "")).strip().lower() in ("1", "true", "yes", "y"):
+            severity += 0.06
+        if str(row.get("SMSReminderSent", "")).strip().lower() in ("0", "false", "no", "n"):
+            severity += 0.035
+        if str(row.get("CallReminderSent", "")).strip().lower() in ("0", "false", "no", "n"):
+            severity += 0.025
+    else:
+        support_tickets = numeric("SupportTicketsPerMonth")
+        if support_tickets is not None:
+            severity += min(0.15, support_tickets * 0.04)
+        monthly_charges = numeric("MonthlyCharges")
+        if monthly_charges is not None and monthly_charges >= 80:
+            severity += 0.045
+        user_rating = numeric("UserRating")
+        if user_rating is not None and user_rating <= 2.5:
+            severity += 0.07
+        viewing_hours = numeric("ViewingHoursPerWeek")
+        if viewing_hours is not None and viewing_hours <= 5:
+            severity += 0.05
+        downloads = numeric("ContentDownloadsPerMonth")
+        if downloads is not None and downloads <= 1:
+            severity += 0.025
+
+    driver_text = " ".join(
+        str(row.get(column, ""))
+        for column in ("model_risk_drivers", "top_churn_drivers", "feature_weight_context")
+        if pd.notna(row.get(column, ""))
+    )
+    if driver_text:
+        driver_count = len([part for part in re.split(r"[,;|]", driver_text) if part.strip()])
+        severity += min(0.08, driver_count * 0.012)
+
+    return min(0.28, severity)
+
+
+def urgency_from_penalty_score(
+    row,
+    probability,
+    risk_stats,
+    row_rank,
+    intervention_name,
+    intervention_counts,
+    cluster_intervention_counts,
+    template_key,
+):
+    risk_strength = normalized_risk_strength(probability, risk_stats)
+    severity = row_context_severity(row, template_key)
+
+    evaluated_rows = max(1, row_rank + 1)
+    global_share = intervention_counts[intervention_name] / evaluated_rows
+    cluster_label = str(row.get("cluster_label", ""))
+    cluster_pair_count = cluster_intervention_counts[(cluster_label, intervention_name)]
+    cluster_share = cluster_pair_count / evaluated_rows
+    saturation_penalty = min(0.25, global_share * 0.30) + min(0.21, cluster_share * 0.38)
+
+    score = (risk_strength * 0.86) + (severity * 0.50) - saturation_penalty
+    if score >= 0.64:
         return "high"
-    if percentile < 0.7:
+    if score >= 0.40:
         return "medium"
     return "low"
 
@@ -3918,22 +4038,11 @@ def build_interventions(at_risk, factors, cluster_labels, cluster_descriptions):
         for label in cluster_labels
     ]
 
+    risk_stats = risk_distribution_stats(result)
     sort_column = probability_sort_column(result)
-    high_cutoff = None
-    medium_cutoff = None
-    use_relative_thresholds = False
     if sort_column:
         sort_values = pd.to_numeric(result[sort_column], errors="coerce")
         if sort_values.notna().any():
-            normalized_sort_values = sort_values.where(sort_values <= 1, sort_values / 100)
-            high_cutoff = normalized_sort_values.quantile(0.8)
-            medium_cutoff = normalized_sort_values.quantile(0.3)
-            use_relative_thresholds = (
-                normalized_sort_values.nunique(dropna=True) > 2
-                and high_cutoff is not None
-                and medium_cutoff is not None
-                and high_cutoff > medium_cutoff
-            )
             result = result.assign(_risk_sort=sort_values).sort_values("_risk_sort", ascending=False)
 
     interventions = []
@@ -3943,14 +4052,6 @@ def build_interventions(at_risk, factors, cluster_labels, cluster_descriptions):
     for row_rank, (_, row) in enumerate(result.iterrows()):
         factor_prefix, factor_description, factor_score = primary_factor_from_row(row, factor_metadata)
         probability = risk_probability(row)
-        if use_relative_thresholds:
-            urgency = urgency_from_relative_risk(probability, high_cutoff, medium_cutoff)
-        else:
-            urgency = None
-
-        if urgency is None:
-            urgency = fallback_urgency_from_rank(row_rank, len(result))
-
         explanation_context = row_prediction_explanation_context(row)
         class_explanation_context = prediction_class_explanation_context(row)
         model_driver_context = feature_weight_context(row)
@@ -3973,6 +4074,16 @@ def build_interventions(at_risk, factors, cluster_labels, cluster_descriptions):
             intervention_counts,
             cluster_intervention_counts,
             intervention_catalog,
+        )
+        urgency = urgency_from_penalty_score(
+            row_context,
+            probability,
+            risk_stats,
+            row_rank,
+            intervention["name"],
+            intervention_counts,
+            cluster_intervention_counts,
+            segment_template,
         )
         intervention_counts[intervention["name"]] += 1
         cluster_intervention_counts[(str(row.get("cluster_label", "")), intervention["name"])] += 1
